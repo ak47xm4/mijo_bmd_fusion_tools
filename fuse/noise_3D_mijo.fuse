@@ -1,0 +1,631 @@
+FuRegisterClass("Noise3D_mijo", CT_Tool, {
+    REGS_Name = "Noise 3D mijo",
+    REGS_Category = "mijo",
+    REGS_OpIconString = "N3D",
+    REGS_OpDescription = "Convert RGB channels to XYZ position and generate grayscale noise",
+    REG_OpNoMask = true,
+    REG_OpNoBlendCtrls = true,
+    REG_NoObjMatCtrls = true,
+    REG_NoMotionBlurCtrls = true,
+})
+
+function Create()
+    print("Noise3D_mijo: Create() called")
+
+    InImage = self:AddInput("Input", "Input", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+    print("Noise3D_mijo: Input added - LINKID_DataType: Image, LINK_Main = 1 (arrow connection)")
+
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+    print("Noise3D_mijo: Output added")
+
+    -- Noise algorithm selection
+    InNoiseType = self:AddInput("Noise Type", "NoiseType", {
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0.0,
+        INP_Integer = true,
+        { CCS_AddString = "Perlin Noise" },
+        { CCS_AddString = "Simplex Noise" },
+        { CCS_AddString = "Value Noise" },
+        { CCS_AddString = "Worley Noise" },
+        { CCS_AddString = "FBM (Fractal Brownian Motion)" },
+        INP_MaxScale = 4.0,
+        INP_MinScale = 0.0,
+    })
+
+    -- Scale/Size parameter
+    InScale = self:AddInput("Scale", "Scale", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 1.0,
+    })
+
+    -- Octaves for FBM
+    InOctaves = self:AddInput("Octaves", "Octaves", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 1.0,
+        INP_MaxScale = 8.0,
+        INP_Default = 4.0,
+        INP_Integer = true,
+    })
+
+    -- Lacunarity for FBM
+    InLacunarity = self:AddInput("Lacunarity", "Lacunarity", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 1.0,
+        INP_MaxScale = 4.0,
+        INP_Default = 2.0,
+    })
+
+    -- Persistence for FBM
+    InPersistence = self:AddInput("Persistence", "Persistence", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 0.5,
+    })
+
+    -- Offset for position
+    InOffsetX = self:AddInput("Offset X", "OffsetX", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -10.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 0.0,
+    })
+
+    InOffsetY = self:AddInput("Offset Y", "OffsetY", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -10.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 0.0,
+    })
+
+    InOffsetZ = self:AddInput("Offset Z", "OffsetZ", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -10.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 0.0,
+    })
+
+    -- Output range
+    InMinValue = self:AddInput("Min Value", "MinValue", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 0.0,
+    })
+
+    InMaxValue = self:AddInput("Max Value", "MaxValue", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 1.0,
+    })
+end
+
+-- Hash function for pseudo-random values
+-- Using mathematical operations for compatibility
+function hash(n)
+    local n_int = math.floor(n)
+    -- Simulate bit operations with math
+    n_int = (n_int * 8192) % 2147483647 -- lshift by 13
+    n_int = math.floor(n_int) % 2147483647
+    local result = (n_int * (n_int * n_int * 15731 + 789221) + 1376312589)
+    result = result % 2147483647 -- bit.band with 0x7fffffff
+    if result < 0 then result = result + 2147483647 end
+    return (1.0 - result / 1073741824.0)
+end
+
+function hash3(x, y, z)
+    local n = math.floor(x) + math.floor(y) * 57 + math.floor(z) * 131
+    return hash(n)
+end
+
+-- Dot product for gradient
+function dot(gx, gy, gz, x, y, z)
+    return gx * x + gy * y + gz * z
+end
+
+-- Fade function for smooth interpolation
+function fade(t)
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+end
+
+function lerp(a, b, t)
+    return a + t * (b - a)
+end
+
+-- Gradient vectors for Perlin noise
+function grad3(hash_val, x, y, z)
+    local h = math.floor(hash_val * 1000) % 16
+    local u = h < 8 and x or y
+    local v = h < 4 and y or (h == 12 or h == 14) and x or z
+    local sign_u = (h % 2 == 0) and 1 or -1
+    local sign_v = (math.floor(h / 2) % 2 == 0) and 1 or -1
+    return sign_u * u + sign_v * v
+end
+
+-- Perlin Noise 3D
+function perlinNoise3D(x, y, z)
+    local X = math.floor(x) % 256
+    local Y = math.floor(y) % 256
+    local Z = math.floor(z) % 256
+
+    x = x - math.floor(x)
+    y = y - math.floor(y)
+    z = z - math.floor(z)
+
+    local u = fade(x)
+    local v = fade(y)
+    local w = fade(z)
+
+    local h000 = hash3(X, Y, Z)
+    local h001 = hash3(X, Y, Z + 1)
+    local h010 = hash3(X, Y + 1, Z)
+    local h011 = hash3(X, Y + 1, Z + 1)
+    local h100 = hash3(X + 1, Y, Z)
+    local h101 = hash3(X + 1, Y, Z + 1)
+    local h110 = hash3(X + 1, Y + 1, Z)
+    local h111 = hash3(X + 1, Y + 1, Z + 1)
+
+    local AAA = grad3(h000, x, y, z)
+    local ABA = grad3(h001, x, y, z - 1)
+    local AAB = grad3(h010, x, y - 1, z)
+    local ABB = grad3(h011, x, y - 1, z - 1)
+    local BAA = grad3(h100, x - 1, y, z)
+    local BBA = grad3(h101, x - 1, y, z - 1)
+    local BAB = grad3(h110, x - 1, y - 1, z)
+    local BBB = grad3(h111, x - 1, y - 1, z - 1)
+
+    return lerp(
+        lerp(
+            lerp(AAA, BAA, u),
+            lerp(ABA, BBA, u),
+            w
+        ),
+        lerp(
+            lerp(AAB, BAB, u),
+            lerp(ABB, BBB, u),
+            w
+        ),
+        v
+    )
+end
+
+-- Simplified Simplex Noise (using Perlin-like implementation)
+function simplexNoise3D(x, y, z)
+    -- Simplified version - can be expanded with proper Simplex implementation
+    return perlinNoise3D(x * 0.707106781, y * 0.707106781, z * 0.707106781)
+end
+
+-- Value Noise 3D
+function valueNoise3D(x, y, z)
+    local X = math.floor(x) % 256
+    local Y = math.floor(y) % 256
+    local Z = math.floor(z) % 256
+
+    x = x - math.floor(x)
+    y = y - math.floor(y)
+    z = z - math.floor(z)
+
+    local u = fade(x)
+    local v = fade(y)
+    local w = fade(z)
+
+    local a = hash3(X, Y, Z)
+    local b = hash3(X + 1, Y, Z)
+    local c = hash3(X, Y + 1, Z)
+    local d = hash3(X + 1, Y + 1, Z)
+    local e = hash3(X, Y, Z + 1)
+    local f = hash3(X + 1, Y, Z + 1)
+    local g = hash3(X, Y + 1, Z + 1)
+    local h = hash3(X + 1, Y + 1, Z + 1)
+
+    return lerp(
+        lerp(
+            lerp(a, b, u),
+            lerp(c, d, u),
+            v
+        ),
+        lerp(
+            lerp(e, f, u),
+            lerp(g, h, u),
+            v
+        ),
+        w
+    )
+end
+
+-- Worley Noise (Cellular Noise) 3D
+function worleyNoise3D(x, y, z)
+    local cellX = math.floor(x)
+    local cellY = math.floor(y)
+    local cellZ = math.floor(z)
+
+    local minDist = math.huge
+
+    for k = -1, 1 do
+        for j = -1, 1 do
+            for i = -1, 1 do
+                local neighborX = cellX + i
+                local neighborY = cellY + j
+                local neighborZ = cellZ + k
+
+                local pointX = neighborX + hash3(neighborX, neighborY, neighborZ) * 0.5 + 0.25
+                local pointY = neighborY + hash3(neighborX + 1, neighborY, neighborZ) * 0.5 + 0.25
+                local pointZ = neighborZ + hash3(neighborX, neighborY + 1, neighborZ) * 0.5 + 0.25
+
+                local dx = x - pointX
+                local dy = y - pointY
+                local dz = z - pointZ
+                local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+                if dist < minDist then
+                    minDist = dist
+                end
+            end
+        end
+    end
+
+    return minDist
+end
+
+-- FBM (Fractal Brownian Motion)
+function fbmNoise3D(x, y, z, octaves, lacunarity, persistence, noiseFunc)
+    local value = 0.0
+    local amplitude = 1.0
+    local frequency = 1.0
+    local maxValue = 0.0
+
+    for i = 0, octaves - 1 do
+        value = value + noiseFunc(x * frequency, y * frequency, z * frequency) * amplitude
+        maxValue = maxValue + amplitude
+        amplitude = amplitude * persistence
+        frequency = frequency * lacunarity
+    end
+
+    return value / maxValue
+end
+
+-- Main noise function dispatcher
+function getNoiseValue(x, y, z, noiseType, scale, octaves, lacunarity, persistence)
+    x = x * scale
+    y = y * scale
+    z = z * scale
+
+    if noiseType == 0 then
+        -- Perlin Noise
+        return perlinNoise3D(x, y, z)
+    elseif noiseType == 1 then
+        -- Simplex Noise
+        return simplexNoise3D(x, y, z)
+    elseif noiseType == 2 then
+        -- Value Noise
+        return valueNoise3D(x, y, z)
+    elseif noiseType == 3 then
+        -- Worley Noise
+        return worleyNoise3D(x, y, z)
+    elseif noiseType == 4 then
+        -- FBM
+        return fbmNoise3D(x, y, z, octaves, lacunarity, persistence, perlinNoise3D)
+    else
+        return perlinNoise3D(x, y, z)
+    end
+end
+
+function Process(req)
+    print("Noise3D_mijo: Process() called at time " .. tostring(req.Time))
+
+    local img = InImage:GetValue(req)
+    print("Noise3D_mijo: Input image retrieved, img = " .. tostring(img))
+
+    if not img then
+        print("Noise3D_mijo: WARNING - No input image, returning nil")
+        return nil
+    end
+
+    print("Noise3D_mijo: Getting parameters...")
+    local noiseType = InNoiseType:GetValue(req).Value
+    local scale = InScale:GetValue(req).Value
+    local octaves = InOctaves:GetValue(req).Value
+    local lacunarity = InLacunarity:GetValue(req).Value
+    local persistence = InPersistence:GetValue(req).Value
+    local offsetX = InOffsetX:GetValue(req).Value
+    local offsetY = InOffsetY:GetValue(req).Value
+    local offsetZ = InOffsetZ:GetValue(req).Value
+    local minValue = InMinValue:GetValue(req).Value
+    local maxValue = InMaxValue:GetValue(req).Value
+
+    print("Noise3D_mijo: Creating output image...")
+
+    -- Get DataWindow and RoI
+    local dod = req:GetInputDoD(InImage)
+    local roi = req:GetRoI()
+    local datawnd = dod:Intersect(img.DataWindow)
+    if roi then
+        datawnd = roi:Intersect(datawnd)
+    end
+
+    local out = Image({
+        IMG_Like = img,
+        IMG_DataWindow = datawnd,
+        IMG_ValidWindow = roi and roi.ValidWindow,
+        IMG_Depth = IMG_Depth_Float,
+        IMG_CopyChannels = true,
+    })
+
+    -- Get image dimensions from DataWindow
+    local DWleft = datawnd.left
+    local DWbottom = datawnd.bottom
+    local DWright = datawnd.right
+    local DWtop = datawnd.top
+    local width = DWright - DWleft
+    local height = DWtop - DWbottom
+
+    print("Noise3D_mijo: Image size: " .. tostring(width) .. "x" .. tostring(height))
+    print("Noise3D_mijo: DataWindow: left=" ..
+        tostring(DWleft) ..
+        ", bottom=" .. tostring(DWbottom) .. ", right=" .. tostring(DWright) .. ", top=" .. tostring(DWtop))
+
+    -- Create a temporary image to read from input
+    local img_temp = Image({
+        IMG_Like = img,
+        IMG_DataWindow = datawnd,
+        IMG_ValidWindow = roi and roi.ValidWindow,
+        IMG_Depth = IMG_Depth_Float,
+        IMG_CopyChannels = true,
+    })
+    img:Crop(img_temp, {})
+
+    -- Process pixels using MultiProcessPixels
+    -- Define function BEFORE creating userData, similar to Grade.fuse
+    local function processPixel(x, y, p)
+        -- Debug: Print first pixel info
+        if x == DWleft and y == DWbottom then
+            print("Noise3D_mijo: Processing first pixel at (" .. tostring(x) .. ", " .. tostring(y) .. ")")
+            print("Noise3D_mijo: Input RGB = (" .. tostring(p.R) .. ", " .. tostring(p.G) .. ", " .. tostring(p.B) .. ")")
+            print("Noise3D_mijo: OffsetX = " ..
+                tostring(OffsetX) .. ", OffsetY = " .. tostring(OffsetY) .. ", OffsetZ = " .. tostring(OffsetZ))
+            print("Noise3D_mijo: NoiseType = " .. tostring(NoiseType) .. ", Scale = " .. tostring(Scale))
+        end
+
+        -- Extract RGB as XYZ position from input pixel
+        -- Access variables from userData (injected as globals by MultiProcessPixels)
+        local posX = p.R + OffsetX
+        local posY = p.G + OffsetY
+        local posZ = p.B + OffsetZ
+
+        -- Scale position
+        local scaledX = posX * Scale
+        local scaledY = posY * Scale
+        local scaledZ = posZ * Scale
+
+        -- Generate noise value based on NoiseType
+        -- Inline implementation to avoid function access issues
+        local noiseValue = 0.0
+
+        -- Helper functions (inline)
+        local function localFade(t)
+            return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+        end
+
+        local function localLerp(a, b, t)
+            return a + t * (b - a)
+        end
+
+        local function localHash(n)
+            local n_int = math.floor(n)
+            n_int = (n_int * 8192) % 2147483647
+            n_int = math.floor(n_int) % 2147483647
+            local result = (n_int * (n_int * n_int * 15731 + 789221) + 1376312589)
+            result = result % 2147483647
+            if result < 0 then result = result + 2147483647 end
+            return (1.0 - result / 1073741824.0)
+        end
+
+        local function localHash3(x, y, z)
+            local n = math.floor(x) + math.floor(y) * 57 + math.floor(z) * 131
+            return localHash(n)
+        end
+
+        local function localGrad3(hash_val, x, y, z)
+            local h = math.floor(hash_val * 1000) % 16
+            local u = h < 8 and x or y
+            local v = h < 4 and y or (h == 12 or h == 14) and x or z
+            local sign_u = (h % 2 == 0) and 1 or -1
+            local sign_v = (math.floor(h / 2) % 2 == 0) and 1 or -1
+            return sign_u * u + sign_v * v
+        end
+
+        -- Inline Perlin Noise 3D
+        local function localPerlinNoise3D(x, y, z)
+            local X = math.floor(x) % 256
+            local Y = math.floor(y) % 256
+            local Z = math.floor(z) % 256
+
+            x = x - math.floor(x)
+            y = y - math.floor(y)
+            z = z - math.floor(z)
+
+            local u = localFade(x)
+            local v = localFade(y)
+            local w = localFade(z)
+
+            local h000 = localHash3(X, Y, Z)
+            local h001 = localHash3(X, Y, Z + 1)
+            local h010 = localHash3(X, Y + 1, Z)
+            local h011 = localHash3(X, Y + 1, Z + 1)
+            local h100 = localHash3(X + 1, Y, Z)
+            local h101 = localHash3(X + 1, Y, Z + 1)
+            local h110 = localHash3(X + 1, Y + 1, Z)
+            local h111 = localHash3(X + 1, Y + 1, Z + 1)
+
+            local AAA = localGrad3(h000, x, y, z)
+            local ABA = localGrad3(h001, x, y, z - 1)
+            local AAB = localGrad3(h010, x, y - 1, z)
+            local ABB = localGrad3(h011, x, y - 1, z - 1)
+            local BAA = localGrad3(h100, x - 1, y, z)
+            local BBA = localGrad3(h101, x - 1, y, z - 1)
+            local BAB = localGrad3(h110, x - 1, y - 1, z)
+            local BBB = localGrad3(h111, x - 1, y - 1, z - 1)
+
+            return localLerp(
+                localLerp(
+                    localLerp(AAA, BAA, u),
+                    localLerp(ABA, BBA, u),
+                    w
+                ),
+                localLerp(
+                    localLerp(AAB, BAB, u),
+                    localLerp(ABB, BBB, u),
+                    w
+                ),
+                v
+            )
+        end
+
+        -- Inline Value Noise 3D
+        local function localValueNoise3D(x, y, z)
+            local X = math.floor(x) % 256
+            local Y = math.floor(y) % 256
+            local Z = math.floor(z) % 256
+
+            x = x - math.floor(x)
+            y = y - math.floor(y)
+            z = z - math.floor(z)
+
+            local u = localFade(x)
+            local v = localFade(y)
+            local w = localFade(z)
+
+            local a = localHash3(X, Y, Z)
+            local b = localHash3(X + 1, Y, Z)
+            local c = localHash3(X, Y + 1, Z)
+            local d = localHash3(X + 1, Y + 1, Z)
+            local e = localHash3(X, Y, Z + 1)
+            local f = localHash3(X + 1, Y, Z + 1)
+            local g = localHash3(X, Y + 1, Z + 1)
+            local h = localHash3(X + 1, Y + 1, Z + 1)
+
+            return localLerp(
+                localLerp(
+                    localLerp(a, b, u),
+                    localLerp(c, d, u),
+                    v
+                ),
+                localLerp(
+                    localLerp(e, f, u),
+                    localLerp(g, h, u),
+                    v
+                ),
+                w
+            )
+        end
+
+        -- Generate noise based on type
+        if NoiseType == 0 then
+            -- Perlin Noise
+            noiseValue = localPerlinNoise3D(scaledX, scaledY, scaledZ)
+        elseif NoiseType == 1 then
+            -- Simplex Noise (simplified, using Perlin)
+            noiseValue = localPerlinNoise3D(scaledX * 0.707106781, scaledY * 0.707106781, scaledZ * 0.707106781)
+        elseif NoiseType == 2 then
+            -- Value Noise
+            noiseValue = localValueNoise3D(scaledX, scaledY, scaledZ)
+        elseif NoiseType == 3 then
+            -- Worley Noise (simplified)
+            local cellX = math.floor(scaledX)
+            local cellY = math.floor(scaledY)
+            local cellZ = math.floor(scaledZ)
+            local minDist = math.huge
+            for k = -1, 1 do
+                for j = -1, 1 do
+                    for i = -1, 1 do
+                        local neighborX = cellX + i
+                        local neighborY = cellY + j
+                        local neighborZ = cellZ + k
+                        local pointX = neighborX + localHash3(neighborX, neighborY, neighborZ) * 0.5 + 0.25
+                        local pointY = neighborY + localHash3(neighborX + 1, neighborY, neighborZ) * 0.5 + 0.25
+                        local pointZ = neighborZ + localHash3(neighborX, neighborY + 1, neighborZ) * 0.5 + 0.25
+                        local dx = scaledX - pointX
+                        local dy = scaledY - pointY
+                        local dz = scaledZ - pointZ
+                        local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+                        if dist < minDist then
+                            minDist = dist
+                        end
+                    end
+                end
+            end
+            noiseValue = minDist * 2.0 - 1.0 -- Normalize
+        elseif NoiseType == 4 then
+            -- FBM
+            local value = 0.0
+            local amplitude = 1.0
+            local frequency = 1.0
+            local maxValue = 0.0
+            for i = 0, Octaves - 1 do
+                value = value +
+                    localPerlinNoise3D(scaledX * frequency, scaledY * frequency, scaledZ * frequency) * amplitude
+                maxValue = maxValue + amplitude
+                amplitude = amplitude * Persistence
+                frequency = frequency * Lacunarity
+            end
+            noiseValue = value / maxValue
+        else
+            -- Default to Perlin
+            noiseValue = localPerlinNoise3D(scaledX, scaledY, scaledZ)
+        end
+
+        if x == DWleft and y == DWbottom then
+            print("Noise3D_mijo: Generated noise value = " .. tostring(noiseValue))
+        end
+
+        -- Normalize from [-1, 1] to [0, 1] if needed, then remap to [minValue, maxValue]
+        noiseValue = (noiseValue + 1.0) * 0.5
+        noiseValue = localLerp(MinValue, MaxValue, noiseValue)
+
+        -- Clamp to valid range
+        noiseValue = math.max(0.0, math.min(1.0, noiseValue))
+
+        -- Set output pixel (grayscale noise)
+        p.R = noiseValue
+        p.G = noiseValue
+        p.B = noiseValue
+        -- Keep original alpha
+        -- p.A remains unchanged
+
+        return p
+    end
+
+    -- Prepare userData - keys will be injected as globals in processPixel function
+    -- Only parameters needed, all functions are inline in processPixel
+    local userData = {
+        OffsetX = offsetX,
+        OffsetY = offsetY,
+        OffsetZ = offsetZ,
+        NoiseType = noiseType,
+        Scale = scale,
+        Octaves = octaves,
+        Lacunarity = lacunarity,
+        Persistence = persistence,
+        MinValue = minValue,
+        MaxValue = maxValue,
+    }
+
+    -- Use MultiProcessPixels to process all pixels
+    -- Process img_temp and write to out
+    print("Noise3D_mijo: Calling MultiProcessPixels with source img_temp, destination out")
+    out:MultiProcessPixels(nil, userData, DWleft, DWbottom, width, height, img_temp, processPixel)
+    print("Noise3D_mijo: MultiProcessPixels completed")
+
+    print("Noise3D_mijo: Setting output...")
+    OutImage:Set(req, out)
+    print("Noise3D_mijo: Process() completed")
+end
