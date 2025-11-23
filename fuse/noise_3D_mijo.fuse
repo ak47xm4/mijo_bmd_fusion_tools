@@ -110,21 +110,26 @@ function Create()
 end
 
 -- Hash function for pseudo-random values
--- Using mathematical operations for compatibility
+-- Using float operations for continuous noise
 function hash(n)
-    -- Handle negative values properly for hash consistency
-    local n_int = math.floor(n)
-    -- Ensure n_int is positive for modulo operations
-    -- Use double modulo to handle negative values correctly
-    n_int = ((n_int * 8192) % 2147483647 + 2147483647) % 2147483647
-    n_int = math.floor(n_int)
-    local result = (n_int * (n_int * n_int * 15731 + 789221) + 1376312589)
-    result = ((result % 2147483647) + 2147483647) % 2147483647
-    return (1.0 - result / 1073741824.0)
+    -- Use sine/cosine with different frequencies for smooth hash
+    -- Use large prime multipliers for good distribution
+    local n1 = n * 12.9898
+    local n2 = n * 78.233
+    local n3 = n * 43758.5453
+    -- Combine multiple sine waves and extract fractional part
+    local h1 = math.sin(n1) * 43758.5453
+    local h2 = math.cos(n2) * 23421.631
+    local h3 = math.sin(n3) * 12345.6789
+    -- Extract fractional part and normalize to [-1, 1]
+    local result = h1 + h2 + h3
+    result = result - math.floor(result)
+    return result * 2.0 - 1.0
 end
 
 function hash3(x, y, z)
-    local n = math.floor(x) + math.floor(y) * 57 + math.floor(z) * 131
+    -- Use float coordinates directly with different multipliers
+    local n = x * 12.9898 + y * 78.233 + z * 43758.5453
     return hash(n)
 end
 
@@ -144,35 +149,40 @@ end
 
 -- Gradient vectors for Perlin noise
 function grad3(hash_val, x, y, z)
-    local h = math.floor(hash_val * 1000) % 16
-    local u = h < 8 and x or y
-    local v = h < 4 and y or (h == 12 or h == 14) and x or z
-    local sign_u = (h % 2 == 0) and 1 or -1
-    local sign_v = (math.floor(h / 2) % 2 == 0) and 1 or -1
-    return sign_u * u + sign_v * v
+    -- Use float hash value to select gradient direction
+    -- Normalize hash to [0, 1] range
+    local h_norm = (hash_val + 1.0) * 0.5
+    -- Use sine/cosine to generate smooth gradient directions
+    local angle1 = h_norm * 6.28318530718                   -- 2*PI
+    local angle2 = (h_norm * 0.61803398875) * 6.28318530718 -- Golden ratio multiplier
+    local u = math.cos(angle1) * x + math.sin(angle1) * y
+    local v = math.cos(angle2) * y + math.sin(angle2) * z
+    return u + v
 end
 
 -- Perlin Noise 3D
 function perlinNoise3D(x, y, z)
-    -- Handle negative coordinates properly for modulo operation
-    -- ((n % 256) + 256) % 256 ensures result is always positive [0, 255]
-    local X = ((math.floor(x) % 256) + 256) % 256
-    local Y = ((math.floor(y) % 256) + 256) % 256
-    local Z = ((math.floor(z) % 256) + 256) % 256
+    -- Use float coordinates directly without integer grid
+    -- Get integer parts for corner positions
+    local X = math.floor(x)
+    local Y = math.floor(y)
+    local Z = math.floor(z)
 
-    -- Calculate neighbor coordinates with proper modulo wrapping
-    local X1 = (X + 1) % 256
-    local Y1 = (Y + 1) % 256
-    local Z1 = (Z + 1) % 256
+    -- Get fractional parts for interpolation
+    local fx = x - X
+    local fy = y - Y
+    local fz = z - Z
 
-    x = x - math.floor(x)
-    y = y - math.floor(y)
-    z = z - math.floor(z)
+    -- Calculate neighbor coordinates (continuous float space)
+    local X1 = X + 1.0
+    local Y1 = Y + 1.0
+    local Z1 = Z + 1.0
 
-    local u = fade(x)
-    local v = fade(y)
-    local w = fade(z)
+    local u = fade(fx)
+    local v = fade(fy)
+    local w = fade(fz)
 
+    -- Use float coordinates for hash (no modulo wrapping)
     local h000 = hash3(X, Y, Z)
     local h001 = hash3(X, Y, Z1)
     local h010 = hash3(X, Y1, Z)
@@ -182,14 +192,14 @@ function perlinNoise3D(x, y, z)
     local h110 = hash3(X1, Y1, Z)
     local h111 = hash3(X1, Y1, Z1)
 
-    local AAA = grad3(h000, x, y, z)
-    local ABA = grad3(h001, x, y, z - 1)
-    local AAB = grad3(h010, x, y - 1, z)
-    local ABB = grad3(h011, x, y - 1, z - 1)
-    local BAA = grad3(h100, x - 1, y, z)
-    local BBA = grad3(h101, x - 1, y, z - 1)
-    local BAB = grad3(h110, x - 1, y - 1, z)
-    local BBB = grad3(h111, x - 1, y - 1, z - 1)
+    local AAA = grad3(h000, fx, fy, fz)
+    local ABA = grad3(h001, fx, fy, fz - 1.0)
+    local AAB = grad3(h010, fx, fy - 1.0, fz)
+    local ABB = grad3(h011, fx, fy - 1.0, fz - 1.0)
+    local BAA = grad3(h100, fx - 1.0, fy, fz)
+    local BBA = grad3(h101, fx - 1.0, fy, fz - 1.0)
+    local BAB = grad3(h110, fx - 1.0, fy - 1.0, fz)
+    local BBB = grad3(h111, fx - 1.0, fy - 1.0, fz - 1.0)
 
     return lerp(
         lerp(
@@ -214,25 +224,27 @@ end
 
 -- Value Noise 3D
 function valueNoise3D(x, y, z)
-    -- Handle negative coordinates properly for modulo operation
-    -- ((n % 256) + 256) % 256 ensures result is always positive [0, 255]
-    local X = ((math.floor(x) % 256) + 256) % 256
-    local Y = ((math.floor(y) % 256) + 256) % 256
-    local Z = ((math.floor(z) % 256) + 256) % 256
+    -- Use float coordinates directly without integer grid
+    -- Get integer parts for corner positions
+    local X = math.floor(x)
+    local Y = math.floor(y)
+    local Z = math.floor(z)
 
-    -- Calculate neighbor coordinates with proper modulo wrapping
-    local X1 = (X + 1) % 256
-    local Y1 = (Y + 1) % 256
-    local Z1 = (Z + 1) % 256
+    -- Get fractional parts for interpolation
+    local fx = x - X
+    local fy = y - Y
+    local fz = z - Z
 
-    x = x - math.floor(x)
-    y = y - math.floor(y)
-    z = z - math.floor(z)
+    -- Calculate neighbor coordinates (continuous float space)
+    local X1 = X + 1.0
+    local Y1 = Y + 1.0
+    local Z1 = Z + 1.0
 
-    local u = fade(x)
-    local v = fade(y)
-    local w = fade(z)
+    local u = fade(fx)
+    local v = fade(fy)
+    local w = fade(fz)
 
+    -- Use float coordinates for hash (no modulo wrapping)
     local a = hash3(X, Y, Z)
     local b = hash3(X1, Y, Z)
     local c = hash3(X, Y1, Z)
@@ -259,6 +271,7 @@ end
 
 -- Worley Noise (Cellular Noise) 3D
 function worleyNoise3D(x, y, z)
+    -- Use float cell coordinates
     local cellX = math.floor(x)
     local cellY = math.floor(y)
     local cellZ = math.floor(z)
@@ -268,13 +281,15 @@ function worleyNoise3D(x, y, z)
     for k = -1, 1 do
         for j = -1, 1 do
             for i = -1, 1 do
+                -- Use float coordinates directly
                 local neighborX = cellX + i
                 local neighborY = cellY + j
                 local neighborZ = cellZ + k
 
+                -- Generate feature point using float hash
                 local pointX = neighborX + hash3(neighborX, neighborY, neighborZ) * 0.5 + 0.25
-                local pointY = neighborY + hash3(neighborX + 1, neighborY, neighborZ) * 0.5 + 0.25
-                local pointZ = neighborZ + hash3(neighborX, neighborY + 1, neighborZ) * 0.5 + 0.25
+                local pointY = neighborY + hash3(neighborX + 1.0, neighborY, neighborZ) * 0.5 + 0.25
+                local pointZ = neighborZ + hash3(neighborX, neighborY + 1.0, neighborZ) * 0.5 + 0.25
 
                 local dx = x - pointX
                 local dy = y - pointY
@@ -345,13 +360,19 @@ function Process(req)
         return nil
     end
 
-    -- Check input image depth - important for preserving negative values
+    -- Check input image depth - this is the *original* upstream image
     -- IMG_Depth_Float = 0, IMG_Depth_8 = 1, IMG_Depth_16 = 2
     local inputDepth = img.Depth
     print("Noise3D_mijo: Input image depth = " .. tostring(inputDepth) .. " (0=Float, 1=8bit, 2=16bit)")
     if inputDepth ~= IMG_Depth_Float then
-        print("Noise3D_mijo: WARNING - Input image is not float depth! Negative values may be clipped.")
-        print("Noise3D_mijo: To preserve negative values, ensure input image is float depth (32-bit float)")
+        print(
+            "Noise3D_mijo: WARNING - Upstream image is not float depth; values may already be clipped/quantized before this Fuse."
+        )
+        print(
+            "Noise3D_mijo: This Fuse will CONVERT internally to 32‑bit float, but lost negative/precision cannot be recovered."
+        )
+        print(
+            "Noise3D_mijo: To truly preserve negative values, ensure the input node feeding this Fuse is 32‑bit float.")
     end
 
     print("Noise3D_mijo: Getting parameters...")
@@ -376,8 +397,8 @@ function Process(req)
         datawnd = roi:Intersect(datawnd)
     end
 
-    -- Create a temporary image to copy source data
-    -- This ensures we can read source pixel values correctly, especially green channel
+    -- Create a temporary image to copy source data, always as 32‑bit float.
+    -- All further processing (noise) is done on this float image.
     local img_temp = Image({
         IMG_Like = img,
         IMG_DataWindow = datawnd,
@@ -385,16 +406,18 @@ function Process(req)
         IMG_Depth = IMG_Depth_Float,
         IMG_CopyChannels = true, -- Copy channels from source to ensure correct values
     })
-    -- Copy source image data to temporary image
+    -- Copy source image data to temporary image (Fusion will convert to float if needed)
     img:Crop(img_temp, {})
+    print("Noise3D_mijo: Internal temp image depth = " .. tostring(img_temp.Depth) .. " (should be 0=Float)")
 
     local out = Image({
         IMG_Like = img_temp,
         IMG_DataWindow = datawnd,
         IMG_ValidWindow = roi and roi.ValidWindow,
-        IMG_Depth = IMG_Depth_Float,
-        IMG_NoData = true, -- Don't copy channels, we'll write our own values
+        IMG_Depth = IMG_Depth_Float, -- force 32‑bit float output
+        IMG_NoData = true,           -- Don't copy channels, we'll write our own values
     })
+    print("Noise3D_mijo: Output image (out) depth = " .. tostring(out.Depth) .. " (should be 0=Float)")
 
     -- Get image dimensions from DataWindow
     local DWleft = datawnd.left
@@ -433,27 +456,21 @@ function Process(req)
         end
 
         -- Extract RGB as XYZ position from input pixel
-        -- Read directly from source image to preserve original values, especially green channel
-        -- If source image is float depth, negative values should be preserved
+        -- IMPORTANT: keep the raw position (including negative values) and let the
+        -- top‑level noise functions handle all negative/periodic behaviour.
+        -- We only add user offsets here.
         local posX = inputPixel.R + OffsetX
         local posY = inputPixel.G + OffsetY
         local posZ = inputPixel.B + OffsetZ
 
-        -- Scale position
-        local scaledX = posX * Scale
-        local scaledY = posY * Scale
-        local scaledZ = posZ * Scale
-
-        -- Debug: Print position values for first pixel and check for negative values
-        -- Focus on green channel (Y coordinate) to debug the stretching issue
+        -- Debug: Print position values for first pixel and check for negative values,
+        -- especially Y (green) which was reported as stretched
         if x == DWleft and y == DWbottom then
             print("Noise3D_mijo: Position XYZ = (" ..
                 tostring(posX) .. ", " .. tostring(posY) .. ", " .. tostring(posZ) .. ")")
-            print("Noise3D_mijo: Scaled XYZ = (" ..
-                tostring(scaledX) .. ", " .. tostring(scaledY) .. ", " .. tostring(scaledZ) .. ")")
             print("Noise3D_mijo: Green channel details - inputPixel.G = " .. tostring(inputPixel.G) ..
                 ", OffsetY = " .. tostring(OffsetY) .. ", posY = " .. tostring(posY) ..
-                ", Scale = " .. tostring(Scale) .. ", scaledY = " .. tostring(scaledY))
+                ", Scale = " .. tostring(Scale) .. " (scale is applied inside getNoiseValue)")
             -- Check specifically for green channel negative values
             if inputPixel.G < 0 then
                 print("Noise3D_mijo: WARNING - Green channel has negative value: " .. tostring(inputPixel.G))
@@ -461,7 +478,9 @@ function Process(req)
         end
 
         -- Generate noise value based on NoiseType
-        -- Inline implementation to avoid function access issues
+        -- 為了避免 MultiProcessPixels 的 sandbox 環境抓不到全域函數，
+        -- 在這裡使用「完全在本地定義」的一組 noise 函數，確保行為在
+        -- R/G/B 三個軸上完全一致，且正負座標處理一致。
         local noiseValue = 0.0
 
         -- Helper functions (inline)
@@ -474,56 +493,61 @@ function Process(req)
         end
 
         local function localHash(n)
-            -- Handle negative values properly for hash consistency
-            -- Use the same implementation as the top-level hash function for consistency
-            local n_int = math.floor(n)
-            -- Ensure n_int is positive for modulo operations
-            -- Use double modulo to handle negative values correctly
-            n_int = ((n_int * 8192) % 2147483647 + 2147483647) % 2147483647
-            n_int = math.floor(n_int)
-            local result = (n_int * (n_int * n_int * 15731 + 789221) + 1376312589)
-            result = ((result % 2147483647) + 2147483647) % 2147483647
-            return (1.0 - result / 1073741824.0)
+            -- Use float operations for continuous noise
+            local n1 = n * 12.9898
+            local n2 = n * 78.233
+            local n3 = n * 43758.5453
+            -- Combine multiple sine waves and extract fractional part
+            local h1 = math.sin(n1) * 43758.5453
+            local h2 = math.cos(n2) * 23421.631
+            local h3 = math.sin(n3) * 12345.6789
+            -- Extract fractional part and normalize to [-1, 1]
+            local result = h1 + h2 + h3
+            result = result - math.floor(result)
+            return result * 2.0 - 1.0
         end
 
         local function localHash3(x, y, z)
-            -- Ensure coordinates are integers and handle negative values properly
-            -- Convert to integers first, handling negative values correctly
-            -- Use the same approach as the top-level hash3 function for consistency
-            local n = math.floor(x) + math.floor(y) * 57 + math.floor(z) * 131
+            -- Use float coordinates directly with different multipliers
+            local n = x * 12.9898 + y * 78.233 + z * 43758.5453
             return localHash(n)
         end
 
         local function localGrad3(hash_val, x, y, z)
-            local h = math.floor(hash_val * 1000) % 16
-            local u = h < 8 and x or y
-            local v = h < 4 and y or (h == 12 or h == 14) and x or z
-            local sign_u = (h % 2 == 0) and 1 or -1
-            local sign_v = (math.floor(h / 2) % 2 == 0) and 1 or -1
-            return sign_u * u + sign_v * v
+            -- Use float hash value to select gradient direction
+            -- Normalize hash to [0, 1] range
+            local h_norm = (hash_val + 1.0) * 0.5
+            -- Use sine/cosine to generate smooth gradient directions
+            local angle1 = h_norm * 6.28318530718                   -- 2*PI
+            local angle2 = (h_norm * 0.61803398875) * 6.28318530718 -- Golden ratio multiplier
+            local u = math.cos(angle1) * x + math.sin(angle1) * y
+            local v = math.cos(angle2) * y + math.sin(angle2) * z
+            return u + v
         end
 
-        -- Inline Perlin Noise 3D
+        -- Inline Perlin Noise 3D（使用浮點座標）
         local function localPerlinNoise3D(x, y, z)
-            -- Handle negative coordinates properly for modulo operation
-            -- ((n % 256) + 256) % 256 ensures result is always positive [0, 255]
-            local X = ((math.floor(x) % 256) + 256) % 256
-            local Y = ((math.floor(y) % 256) + 256) % 256
-            local Z = ((math.floor(z) % 256) + 256) % 256
+            -- Use float coordinates directly without integer grid
+            -- Get integer parts for corner positions
+            local X = math.floor(x)
+            local Y = math.floor(y)
+            local Z = math.floor(z)
 
-            -- Calculate neighbor coordinates with proper modulo wrapping
-            local X1 = (X + 1) % 256
-            local Y1 = (Y + 1) % 256
-            local Z1 = (Z + 1) % 256
+            -- Get fractional parts for interpolation
+            local fx = x - X
+            local fy = y - Y
+            local fz = z - Z
 
-            x = x - math.floor(x)
-            y = y - math.floor(y)
-            z = z - math.floor(z)
+            -- Calculate neighbor coordinates (continuous float space)
+            local X1 = X + 1.0
+            local Y1 = Y + 1.0
+            local Z1 = Z + 1.0
 
-            local u = localFade(x)
-            local v = localFade(y)
-            local w = localFade(z)
+            local u = localFade(fx)
+            local v = localFade(fy)
+            local w = localFade(fz)
 
+            -- Use float coordinates for hash (no modulo wrapping)
             local h000 = localHash3(X, Y, Z)
             local h001 = localHash3(X, Y, Z1)
             local h010 = localHash3(X, Y1, Z)
@@ -533,14 +557,14 @@ function Process(req)
             local h110 = localHash3(X1, Y1, Z)
             local h111 = localHash3(X1, Y1, Z1)
 
-            local AAA = localGrad3(h000, x, y, z)
-            local ABA = localGrad3(h001, x, y, z - 1)
-            local AAB = localGrad3(h010, x, y - 1, z)
-            local ABB = localGrad3(h011, x, y - 1, z - 1)
-            local BAA = localGrad3(h100, x - 1, y, z)
-            local BBA = localGrad3(h101, x - 1, y, z - 1)
-            local BAB = localGrad3(h110, x - 1, y - 1, z)
-            local BBB = localGrad3(h111, x - 1, y - 1, z - 1)
+            local AAA = localGrad3(h000, fx, fy, fz)
+            local ABA = localGrad3(h001, fx, fy, fz - 1.0)
+            local AAB = localGrad3(h010, fx, fy - 1.0, fz)
+            local ABB = localGrad3(h011, fx, fy - 1.0, fz - 1.0)
+            local BAA = localGrad3(h100, fx - 1.0, fy, fz)
+            local BBA = localGrad3(h101, fx - 1.0, fy, fz - 1.0)
+            local BAB = localGrad3(h110, fx - 1.0, fy - 1.0, fz)
+            local BBB = localGrad3(h111, fx - 1.0, fy - 1.0, fz - 1.0)
 
             return localLerp(
                 localLerp(
@@ -559,25 +583,27 @@ function Process(req)
 
         -- Inline Value Noise 3D
         local function localValueNoise3D(x, y, z)
-            -- Handle negative coordinates properly for modulo operation
-            -- ((n % 256) + 256) % 256 ensures result is always positive [0, 255]
-            local X = ((math.floor(x) % 256) + 256) % 256
-            local Y = ((math.floor(y) % 256) + 256) % 256
-            local Z = ((math.floor(z) % 256) + 256) % 256
+            -- Use float coordinates directly without integer grid
+            -- Get integer parts for corner positions
+            local X = math.floor(x)
+            local Y = math.floor(y)
+            local Z = math.floor(z)
 
-            -- Calculate neighbor coordinates with proper modulo wrapping
-            local X1 = (X + 1) % 256
-            local Y1 = (Y + 1) % 256
-            local Z1 = (Z + 1) % 256
+            -- Get fractional parts for interpolation
+            local fx = x - X
+            local fy = y - Y
+            local fz = z - Z
 
-            x = x - math.floor(x)
-            y = y - math.floor(y)
-            z = z - math.floor(z)
+            -- Calculate neighbor coordinates (continuous float space)
+            local X1 = X + 1.0
+            local Y1 = Y + 1.0
+            local Z1 = Z + 1.0
 
-            local u = localFade(x)
-            local v = localFade(y)
-            local w = localFade(z)
+            local u = localFade(fx)
+            local v = localFade(fy)
+            local w = localFade(fz)
 
+            -- Use float coordinates for hash (no modulo wrapping)
             local a = localHash3(X, Y, Z)
             local b = localHash3(X1, Y, Z)
             local c = localHash3(X, Y1, Z)
@@ -602,34 +628,39 @@ function Process(req)
             )
         end
 
-        -- Generate noise based on type
+        -- 根據 NoiseType 選擇 noise
         if NoiseType == 0 then
             -- Perlin Noise
-            noiseValue = localPerlinNoise3D(scaledX, scaledY, scaledZ)
+            noiseValue = localPerlinNoise3D(posX * Scale, posY * Scale, posZ * Scale)
         elseif NoiseType == 1 then
-            -- Simplex Noise (simplified, using Perlin)
-            noiseValue = localPerlinNoise3D(scaledX * 0.707106781, scaledY * 0.707106781, scaledZ * 0.707106781)
+            -- Simplex Noise (簡化，用 Perlin 近似對角線方向)
+            local s = 0.707106781
+            noiseValue = localPerlinNoise3D(posX * Scale * s, posY * Scale * s, posZ * Scale * s)
         elseif NoiseType == 2 then
             -- Value Noise
-            noiseValue = localValueNoise3D(scaledX, scaledY, scaledZ)
+            noiseValue = localValueNoise3D(posX * Scale, posY * Scale, posZ * Scale)
         elseif NoiseType == 3 then
-            -- Worley Noise (simplified)
-            local cellX = math.floor(scaledX)
-            local cellY = math.floor(scaledY)
-            local cellZ = math.floor(scaledZ)
+            -- Worley Noise（cellular）
+            local sx = posX * Scale
+            local sy = posY * Scale
+            local sz = posZ * Scale
+            local cellX = math.floor(sx)
+            local cellY = math.floor(sy)
+            local cellZ = math.floor(sz)
             local minDist = math.huge
             for k = -1, 1 do
                 for j = -1, 1 do
                     for i = -1, 1 do
+                        -- Use float coordinates directly
                         local neighborX = cellX + i
                         local neighborY = cellY + j
                         local neighborZ = cellZ + k
                         local pointX = neighborX + localHash3(neighborX, neighborY, neighborZ) * 0.5 + 0.25
-                        local pointY = neighborY + localHash3(neighborX + 1, neighborY, neighborZ) * 0.5 + 0.25
-                        local pointZ = neighborZ + localHash3(neighborX, neighborY + 1, neighborZ) * 0.5 + 0.25
-                        local dx = scaledX - pointX
-                        local dy = scaledY - pointY
-                        local dz = scaledZ - pointZ
+                        local pointY = neighborY + localHash3(neighborX + 1.0, neighborY, neighborZ) * 0.5 + 0.25
+                        local pointZ = neighborZ + localHash3(neighborX, neighborY + 1.0, neighborZ) * 0.5 + 0.25
+                        local dx = sx - pointX
+                        local dy = sy - pointY
+                        local dz = sz - pointZ
                         local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
                         if dist < minDist then
                             minDist = dist
@@ -637,16 +668,17 @@ function Process(req)
                     end
                 end
             end
-            noiseValue = minDist * 2.0 - 1.0 -- Normalize
+            noiseValue = minDist * 2.0 - 1.0
         elseif NoiseType == 4 then
-            -- FBM
+            -- FBM（使用 Perlin 組合）
             local value = 0.0
             local amplitude = 1.0
             local frequency = 1.0
             local maxValue = 0.0
             for i = 0, Octaves - 1 do
                 value = value +
-                    localPerlinNoise3D(scaledX * frequency, scaledY * frequency, scaledZ * frequency) * amplitude
+                    localPerlinNoise3D(posX * Scale * frequency, posY * Scale * frequency,
+                        posZ * Scale * frequency) * amplitude
                 maxValue = maxValue + amplitude
                 amplitude = amplitude * Persistence
                 frequency = frequency * Lacunarity
@@ -654,7 +686,7 @@ function Process(req)
             noiseValue = value / maxValue
         else
             -- Default to Perlin
-            noiseValue = localPerlinNoise3D(scaledX, scaledY, scaledZ)
+            noiseValue = localPerlinNoise3D(posX * Scale, posY * Scale, posZ * Scale)
         end
 
         if x == DWleft and y == DWbottom then
@@ -679,9 +711,12 @@ function Process(req)
         return p
     end
 
-    -- Prepare userData - keys will be injected as globals in processPixel function
-    -- Only parameters needed, all functions are inline in processPixel
+    -- Prepare userData - keys will be injected as globals in processPixel function.
+    -- We also pass the top‑level helper functions we want to use (getNoiseValue, lerp)
+    -- because the pixel-processing environment is reconstructed from this table.
     local userData = {
+        getNoiseValue = getNoiseValue,
+        lerp = lerp,
         OffsetX = offsetX,
         OffsetY = offsetY,
         OffsetZ = offsetZ,
