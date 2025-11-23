@@ -34,6 +34,17 @@ function Create()
         INP_MinScale = 0.0,
     })
 
+    -- Output mode selection
+    InOutputMode = self:AddInput("Output Mode", "OutputMode", {
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0.0,
+        INP_Integer = true,
+        { CCS_AddString = "Grayscale" },
+        { CCS_AddString = "RGB" },
+        INP_MaxScale = 1.0,
+        INP_MinScale = 0.0,
+    })
+
     -- Scale/Size parameter
     InScale = self:AddInput("Scale", "Scale", {
         INPID_InputControl = "SliderControl",
@@ -389,6 +400,7 @@ function Process(req)
     -- IMG_Depth_Float = 0, IMG_Depth_8 = 1, IMG_Depth_16 = 2
     local inputDepth = img.Depth
     local noiseType = InNoiseType:GetValue(req).Value
+    local outputMode = InOutputMode:GetValue(req).Value
     local scale = InScale:GetValue(req).Value
     local scaleX = InScaleX:GetValue(req).Value
     local scaleY = InScaleY:GetValue(req).Value
@@ -404,8 +416,12 @@ function Process(req)
     local minValue = InMinValue:GetValue(req).Value
     local maxValue = InMaxValue:GetValue(req).Value
 
-    -- Get current time for animation
-    local currentTime = req.Time or 0.0
+    -- Get current time for animation (only when SeetheRate > 0 to optimize cache)
+    -- When SeetheRate = 0, we don't use time, so Fusion can cache the result
+    local currentTime = 0.0
+    if seetheRate > 0.0 then
+        currentTime = req.Time or 0.0
+    end
 
     -- Get DataWindow and RoI
     local dod = req:GetInputDoD(InImage)
@@ -593,85 +609,108 @@ function Process(req)
         -- Calculate time offset for animation (only used for noise types that support animation)
         local timeOffset = CurrentTime * SeetheRate + Seethe
 
-        -- Optimized noise type selection with precomputed scales
-        if NoiseType == 0 then
-            -- Perlin Noise (supports animation)
-            noiseValue = localPerlinNoise3D(posX * Scale * ScaleX, posY * Scale * ScaleY,
-                (posZ + timeOffset) * Scale * ScaleZ)
-        elseif NoiseType == 1 then
-            -- Simplex Noise (simplified, using Perlin approximation) (supports animation)
-            local s = 0.707106781 -- sqrt(0.5) for Simplex
-            noiseValue = localPerlinNoise3D(posX * Scale * ScaleX * s, posY * Scale * ScaleY * s,
-                (posZ + timeOffset) * Scale * ScaleZ * s)
-        elseif NoiseType == 2 then
-            -- Value Noise (supports animation)
-            noiseValue = localValueNoise3D(posX * Scale * ScaleX, posY * Scale * ScaleY,
-                (posZ + timeOffset) * Scale * ScaleZ)
-        elseif NoiseType == 3 then
-            -- Worley Noise (cellular) - optimized with distance squared
-            local sx = posX * Scale * ScaleX
-            local sy = posY * Scale * ScaleY
-            local sz = posZ * Scale * ScaleZ
-            local cellX = math.floor(sx)
-            local cellY = math.floor(sy)
-            local cellZ = math.floor(sz)
-            local minDistSq = math.huge
-            for k = -1, 1 do
-                for j = -1, 1 do
-                    for i = -1, 1 do
-                        local neighborX = cellX + i
-                        local neighborY = cellY + j
-                        local neighborZ = cellZ + k
-                        local pointX = neighborX + localHash3(neighborX, neighborY, neighborZ) * 0.5 + 0.25
-                        local pointY = neighborY + localHash3(neighborX + 1.0, neighborY, neighborZ) * 0.5 + 0.25
-                        local pointZ = neighborZ + localHash3(neighborX, neighborY + 1.0, neighborZ) * 0.5 + 0.25
-                        local dx = sx - pointX
-                        local dy = sy - pointY
-                        local dz = sz - pointZ
-                        local distSq = dx * dx + dy * dy + dz * dz
-                        if distSq < minDistSq then
-                            minDistSq = distSq
+        -- Helper function to generate noise value with channel offset for RGB mode
+        local function generateNoise(channelOffsetX, channelOffsetY, channelOffsetZ)
+            local noiseVal = 0.0
+            local finalPosX = posX + channelOffsetX
+            local finalPosY = posY + channelOffsetY
+            local finalPosZ = posZ + channelOffsetZ + timeOffset
+
+            -- Optimized noise type selection with precomputed scales
+            if NoiseType == 0 then
+                -- Perlin Noise (supports animation)
+                noiseVal = localPerlinNoise3D(finalPosX * Scale * ScaleX, finalPosY * Scale * ScaleY,
+                    finalPosZ * Scale * ScaleZ)
+            elseif NoiseType == 1 then
+                -- Simplex Noise (simplified, using Perlin approximation) (supports animation)
+                local s = 0.707106781 -- sqrt(0.5) for Simplex
+                noiseVal = localPerlinNoise3D(finalPosX * Scale * ScaleX * s, finalPosY * Scale * ScaleY * s,
+                    finalPosZ * Scale * ScaleZ * s)
+            elseif NoiseType == 2 then
+                -- Value Noise (supports animation)
+                noiseVal = localValueNoise3D(finalPosX * Scale * ScaleX, finalPosY * Scale * ScaleY,
+                    finalPosZ * Scale * ScaleZ)
+            elseif NoiseType == 3 then
+                -- Worley Noise (cellular) - optimized with distance squared
+                local sx = finalPosX * Scale * ScaleX
+                local sy = finalPosY * Scale * ScaleY
+                local sz = finalPosZ * Scale * ScaleZ
+                local cellX = math.floor(sx)
+                local cellY = math.floor(sy)
+                local cellZ = math.floor(sz)
+                local minDistSq = math.huge
+                for k = -1, 1 do
+                    for j = -1, 1 do
+                        for i = -1, 1 do
+                            local neighborX = cellX + i
+                            local neighborY = cellY + j
+                            local neighborZ = cellZ + k
+                            local pointX = neighborX + localHash3(neighborX, neighborY, neighborZ) * 0.5 + 0.25
+                            local pointY = neighborY + localHash3(neighborX + 1.0, neighborY, neighborZ) * 0.5 + 0.25
+                            local pointZ = neighborZ + localHash3(neighborX, neighborY + 1.0, neighborZ) * 0.5 + 0.25
+                            local dx = sx - pointX
+                            local dy = sy - pointY
+                            local dz = sz - pointZ
+                            local distSq = dx * dx + dy * dy + dz * dz
+                            if distSq < minDistSq then
+                                minDistSq = distSq
+                            end
                         end
                     end
                 end
+                -- Only calculate sqrt once at the end
+                noiseVal = math.sqrt(minDistSq) * 2.0 - 1.0
+            elseif NoiseType == 4 then
+                -- FBM (Fractal Brownian Motion) - optimized loop (supports animation)
+                local value = 0.0
+                local amplitude = 1.0
+                local frequency = 1.0
+                local maxValue = 0.0
+                local posX_scaled = finalPosX * Scale * ScaleX
+                local posY_scaled = finalPosY * Scale * ScaleY
+                local posZ_scaled = finalPosZ * Scale * ScaleZ
+                for i = 0, Octaves - 1 do
+                    value = value +
+                        localPerlinNoise3D(posX_scaled * frequency, posY_scaled * frequency, posZ_scaled * frequency) *
+                        amplitude
+                    maxValue = maxValue + amplitude
+                    amplitude = amplitude * Persistence
+                    frequency = frequency * Lacunarity
+                end
+                noiseVal = value / maxValue
+            else
+                -- Default to Perlin (supports animation)
+                noiseVal = localPerlinNoise3D(finalPosX * Scale * ScaleX, finalPosY * Scale * ScaleY,
+                    finalPosZ * Scale * ScaleZ)
             end
-            -- Only calculate sqrt once at the end
-            noiseValue = math.sqrt(minDistSq) * 2.0 - 1.0
-        elseif NoiseType == 4 then
-            -- FBM (Fractal Brownian Motion) - optimized loop (supports animation)
-            local value = 0.0
-            local amplitude = 1.0
-            local frequency = 1.0
-            local maxValue = 0.0
-            local posX_scaled = posX * Scale * ScaleX
-            local posY_scaled = posY * Scale * ScaleY
-            local posZ_scaled = (posZ + timeOffset) * Scale * ScaleZ
-            for i = 0, Octaves - 1 do
-                value = value +
-                    localPerlinNoise3D(posX_scaled * frequency, posY_scaled * frequency, posZ_scaled * frequency) *
-                    amplitude
-                maxValue = maxValue + amplitude
-                amplitude = amplitude * Persistence
-                frequency = frequency * Lacunarity
-            end
-            noiseValue = value / maxValue
-        else
-            -- Default to Perlin (supports animation)
-            noiseValue = localPerlinNoise3D(posX * Scale * ScaleX, posY * Scale * ScaleY,
-                (posZ + timeOffset) * Scale * ScaleZ)
+
+            -- Normalize from [-1, 1] to [0, 1] if needed, then remap to [minValue, maxValue]
+            noiseVal = (noiseVal + 1.0) * 0.5
+            noiseVal = localLerp(MinValue, MaxValue, noiseVal)
+
+            -- Clamp to valid range (optimized single-line clamp)
+            noiseVal = noiseVal < 0.0 and 0.0 or (noiseVal > 1.0 and 1.0 or noiseVal)
+
+            return noiseVal
         end
 
-        -- Normalize from [-1, 1] to [0, 1] if needed, then remap to [minValue, maxValue]
-        noiseValue = (noiseValue + 1.0) * 0.5
-        noiseValue = localLerp(MinValue, MaxValue, noiseValue)
-
-        -- Clamp to valid range (optimized single-line clamp)
-        noiseValue = noiseValue < 0.0 and 0.0 or (noiseValue > 1.0 and 1.0 or noiseValue)
-
-        -- Set output pixel (grayscale noise)
-        p.R = noiseValue
-        p.G = noiseValue
-        p.B = noiseValue
+        -- Generate noise based on output mode
+        if OutputMode == 1 then
+            -- RGB mode: generate different noise for each channel using offsets
+            -- Use different offsets to create variation between channels
+            local offsetR = 100.0 -- Offset for Red channel
+            local offsetG = 200.0 -- Offset for Green channel
+            local offsetB = 300.0 -- Offset for Blue channel
+            p.R = generateNoise(offsetR, offsetR * 0.5, offsetR * 0.25)
+            p.G = generateNoise(offsetG, offsetG * 0.5, offsetG * 0.25)
+            p.B = generateNoise(offsetB, offsetB * 0.5, offsetB * 0.25)
+        else
+            -- Grayscale mode: same noise for all channels
+            local noiseValue = generateNoise(0.0, 0.0, 0.0)
+            p.R = noiseValue
+            p.G = noiseValue
+            p.B = noiseValue
+        end
         -- Alpha is preserved automatically by MultiProcessPixels
 
         return p
@@ -683,6 +722,7 @@ function Process(req)
         OffsetY = offsetY,
         OffsetZ = offsetZ,
         NoiseType = noiseType,
+        OutputMode = outputMode,
         Scale = scale,
         ScaleX = scaleX,
         ScaleY = scaleY,
