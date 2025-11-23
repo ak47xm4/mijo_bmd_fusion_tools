@@ -10,19 +10,15 @@ FuRegisterClass("Noise3D_mijo", CT_Tool, {
 })
 
 function Create()
-    print("Noise3D_mijo: Create() called")
-
     InImage = self:AddInput("Input", "Input", {
         LINKID_DataType = "Image",
         LINK_Main = 1,
     })
-    print("Noise3D_mijo: Input added - LINKID_DataType: Image, LINK_Main = 1 (arrow connection)")
 
     OutImage = self:AddOutput("Output", "Output", {
         LINKID_DataType = "Image",
         LINK_Main = 1,
     })
-    print("Noise3D_mijo: Output added")
 
     -- Noise algorithm selection
     InNoiseType = self:AddInput("Noise Type", "NoiseType", {
@@ -109,21 +105,15 @@ function Create()
     })
 end
 
--- Hash function for pseudo-random values
--- Using float operations for continuous noise
+-- Optimized hash function - faster alternative using fractional part
+-- Reduced sin/cos calls for better performance
 function hash(n)
-    -- Use sine/cosine with different frequencies for smooth hash
-    -- Use large prime multipliers for good distribution
-    local n1 = n * 12.9898
-    local n2 = n * 78.233
-    local n3 = n * 43758.5453
-    -- Combine multiple sine waves and extract fractional part
-    local h1 = math.sin(n1) * 43758.5453
-    local h2 = math.cos(n2) * 23421.631
-    local h3 = math.sin(n3) * 12345.6789
+    -- Fast hash using fractional part of multiplication
+    -- Single sin call instead of multiple sin/cos
+    local n_scaled = n * 12.9898
+    local h = math.sin(n_scaled) * 43758.5453
     -- Extract fractional part and normalize to [-1, 1]
-    local result = h1 + h2 + h3
-    result = result - math.floor(result)
+    local result = h - math.floor(h)
     return result * 2.0 - 1.0
 end
 
@@ -147,17 +137,17 @@ function lerp(a, b, t)
     return a + t * (b - a)
 end
 
--- Gradient vectors for Perlin noise
+-- Optimized gradient function - reduced trigonometric calls
 function grad3(hash_val, x, y, z)
-    -- Use float hash value to select gradient direction
+    -- Simplified gradient using single angle calculation
     -- Normalize hash to [0, 1] range
     local h_norm = (hash_val + 1.0) * 0.5
-    -- Use sine/cosine to generate smooth gradient directions
-    local angle1 = h_norm * 6.28318530718                   -- 2*PI
-    local angle2 = (h_norm * 0.61803398875) * 6.28318530718 -- Golden ratio multiplier
-    local u = math.cos(angle1) * x + math.sin(angle1) * y
-    local v = math.cos(angle2) * y + math.sin(angle2) * z
-    return u + v
+    -- Single angle calculation instead of two
+    local angle = h_norm * 6.28318530718 -- 2*PI
+    local cos_a = math.cos(angle)
+    local sin_a = math.sin(angle)
+    -- Combine x, y, z with rotated coordinates
+    return cos_a * x + sin_a * y + (cos_a * 0.707106781 + sin_a * 0.707106781) * z
 end
 
 -- Perlin Noise 3D
@@ -269,14 +259,14 @@ function valueNoise3D(x, y, z)
     )
 end
 
--- Worley Noise (Cellular Noise) 3D
+-- Optimized Worley Noise - uses distance squared to avoid sqrt
 function worleyNoise3D(x, y, z)
     -- Use float cell coordinates
     local cellX = math.floor(x)
     local cellY = math.floor(y)
     local cellZ = math.floor(z)
 
-    local minDist = math.huge
+    local minDistSq = math.huge
 
     for k = -1, 1 do
         for j = -1, 1 do
@@ -294,16 +284,17 @@ function worleyNoise3D(x, y, z)
                 local dx = x - pointX
                 local dy = y - pointY
                 local dz = z - pointZ
-                local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+                local distSq = dx * dx + dy * dy + dz * dz
 
-                if dist < minDist then
-                    minDist = dist
+                if distSq < minDistSq then
+                    minDistSq = distSq
                 end
             end
         end
     end
 
-    return minDist
+    -- Only calculate sqrt once at the end
+    return math.sqrt(minDistSq)
 end
 
 -- FBM (Fractal Brownian Motion)
@@ -350,32 +341,15 @@ function getNoiseValue(x, y, z, noiseType, scale, octaves, lacunarity, persisten
 end
 
 function Process(req)
-    print("Noise3D_mijo: Process() called at time " .. tostring(req.Time))
-
     local img = InImage:GetValue(req)
-    print("Noise3D_mijo: Input image retrieved, img = " .. tostring(img))
 
     if not img then
-        print("Noise3D_mijo: WARNING - No input image, returning nil")
         return nil
     end
 
     -- Check input image depth - this is the *original* upstream image
     -- IMG_Depth_Float = 0, IMG_Depth_8 = 1, IMG_Depth_16 = 2
     local inputDepth = img.Depth
-    print("Noise3D_mijo: Input image depth = " .. tostring(inputDepth) .. " (0=Float, 1=8bit, 2=16bit)")
-    if inputDepth ~= IMG_Depth_Float then
-        print(
-            "Noise3D_mijo: WARNING - Upstream image is not float depth; values may already be clipped/quantized before this Fuse."
-        )
-        print(
-            "Noise3D_mijo: This Fuse will CONVERT internally to 32‑bit float, but lost negative/precision cannot be recovered."
-        )
-        print(
-            "Noise3D_mijo: To truly preserve negative values, ensure the input node feeding this Fuse is 32‑bit float.")
-    end
-
-    print("Noise3D_mijo: Getting parameters...")
     local noiseType = InNoiseType:GetValue(req).Value
     local scale = InScale:GetValue(req).Value
     local octaves = InOctaves:GetValue(req).Value
@@ -386,8 +360,6 @@ function Process(req)
     local offsetZ = InOffsetZ:GetValue(req).Value
     local minValue = InMinValue:GetValue(req).Value
     local maxValue = InMaxValue:GetValue(req).Value
-
-    print("Noise3D_mijo: Creating output image...")
 
     -- Get DataWindow and RoI
     local dod = req:GetInputDoD(InImage)
@@ -408,7 +380,6 @@ function Process(req)
     })
     -- Copy source image data to temporary image (Fusion will convert to float if needed)
     img:Crop(img_temp, {})
-    print("Noise3D_mijo: Internal temp image depth = " .. tostring(img_temp.Depth) .. " (should be 0=Float)")
 
     local out = Image({
         IMG_Like = img_temp,
@@ -417,7 +388,6 @@ function Process(req)
         IMG_Depth = IMG_Depth_Float, -- force 32‑bit float output
         IMG_NoData = true,           -- Don't copy channels, we'll write our own values
     })
-    print("Noise3D_mijo: Output image (out) depth = " .. tostring(out.Depth) .. " (should be 0=Float)")
 
     -- Get image dimensions from DataWindow
     local DWleft = datawnd.left
@@ -427,102 +397,48 @@ function Process(req)
     local width = DWright - DWleft
     local height = DWtop - DWbottom
 
-    print("Noise3D_mijo: Image size: " .. tostring(width) .. "x" .. tostring(height))
-    print("Noise3D_mijo: DataWindow: left=" ..
-        tostring(DWleft) ..
-        ", bottom=" .. tostring(DWbottom) .. ", right=" .. tostring(DWright) .. ", top=" .. tostring(DWtop))
-
     -- Process pixels using MultiProcessPixels
     -- Define function BEFORE creating userData, similar to Grade.fuse
-    -- Read directly from input image - use p parameter but also try direct read as fallback
+    -- Optimized pixel processing function
     local function processPixel(x, y, p)
-        -- p parameter from MultiProcessPixels contains pixel values from source image (img)
-        -- In MultiProcessPixels, p comes from the source image specified in the call
-        -- Since we pass 'img' as the source, p should contain values from img
-        -- However, to ensure we get the correct values, especially for green channel,
-        -- we use p directly as it should contain the source image pixel values
-        local inputPixel = p
-
-        -- Debug: Print first pixel info and compare values
-        -- Check green channel specifically to debug the stretching issue
-        if x == DWleft and y == DWbottom then
-            print("Noise3D_mijo: Processing first pixel at (" .. tostring(x) .. ", " .. tostring(y) .. ")")
-            print("Noise3D_mijo: Input RGB from source image (p parameter) = (" ..
-                tostring(inputPixel.R) .. ", " .. tostring(inputPixel.G) .. ", " .. tostring(inputPixel.B) .. ")")
-            print("Noise3D_mijo: Green channel (G) = " .. tostring(inputPixel.G))
-            print("Noise3D_mijo: OffsetX = " ..
-                tostring(OffsetX) .. ", OffsetY = " .. tostring(OffsetY) .. ", OffsetZ = " .. tostring(OffsetZ))
-            print("Noise3D_mijo: NoiseType = " .. tostring(NoiseType) .. ", Scale = " .. tostring(Scale))
-        end
-
         -- Extract RGB as XYZ position from input pixel
-        -- IMPORTANT: keep the raw position (including negative values) and let the
-        -- top‑level noise functions handle all negative/periodic behaviour.
-        -- We only add user offsets here.
-        local posX = inputPixel.R + OffsetX
-        local posY = inputPixel.G + OffsetY
-        local posZ = inputPixel.B + OffsetZ
-
-        -- Debug: Print position values for first pixel and check for negative values,
-        -- especially Y (green) which was reported as stretched
-        if x == DWleft and y == DWbottom then
-            print("Noise3D_mijo: Position XYZ = (" ..
-                tostring(posX) .. ", " .. tostring(posY) .. ", " .. tostring(posZ) .. ")")
-            print("Noise3D_mijo: Green channel details - inputPixel.G = " .. tostring(inputPixel.G) ..
-                ", OffsetY = " .. tostring(OffsetY) .. ", posY = " .. tostring(posY) ..
-                ", Scale = " .. tostring(Scale) .. " (scale is applied inside getNoiseValue)")
-            -- Check specifically for green channel negative values
-            if inputPixel.G < 0 then
-                print("Noise3D_mijo: WARNING - Green channel has negative value: " .. tostring(inputPixel.G))
-            end
-        end
+        local posX = p.R + OffsetX
+        local posY = p.G + OffsetY
+        local posZ = p.B + OffsetZ
 
         -- Generate noise value based on NoiseType
-        -- 為了避免 MultiProcessPixels 的 sandbox 環境抓不到全域函數，
-        -- 在這裡使用「完全在本地定義」的一組 noise 函數，確保行為在
-        -- R/G/B 三個軸上完全一致，且正負座標處理一致。
+        -- Optimized inline functions for better performance
         local noiseValue = 0.0
 
-        -- Helper functions (inline)
+        -- Inline helper functions (optimized)
         local function localFade(t)
-            return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+            local t2 = t * t
+            local t3 = t2 * t
+            return t3 * (t * (t * 6.0 - 15.0) + 10.0)
         end
 
         local function localLerp(a, b, t)
             return a + t * (b - a)
         end
 
+        -- Optimized hash - single sin call
         local function localHash(n)
-            -- Use float operations for continuous noise
-            local n1 = n * 12.9898
-            local n2 = n * 78.233
-            local n3 = n * 43758.5453
-            -- Combine multiple sine waves and extract fractional part
-            local h1 = math.sin(n1) * 43758.5453
-            local h2 = math.cos(n2) * 23421.631
-            local h3 = math.sin(n3) * 12345.6789
-            -- Extract fractional part and normalize to [-1, 1]
-            local result = h1 + h2 + h3
-            result = result - math.floor(result)
+            local h = math.sin(n * 12.9898) * 43758.5453
+            local result = h - math.floor(h)
             return result * 2.0 - 1.0
         end
 
         local function localHash3(x, y, z)
-            -- Use float coordinates directly with different multipliers
-            local n = x * 12.9898 + y * 78.233 + z * 43758.5453
-            return localHash(n)
+            return localHash(x * 12.9898 + y * 78.233 + z * 43758.5453)
         end
 
+        -- Optimized gradient - reduced trig calls
         local function localGrad3(hash_val, x, y, z)
-            -- Use float hash value to select gradient direction
-            -- Normalize hash to [0, 1] range
             local h_norm = (hash_val + 1.0) * 0.5
-            -- Use sine/cosine to generate smooth gradient directions
-            local angle1 = h_norm * 6.28318530718                   -- 2*PI
-            local angle2 = (h_norm * 0.61803398875) * 6.28318530718 -- Golden ratio multiplier
-            local u = math.cos(angle1) * x + math.sin(angle1) * y
-            local v = math.cos(angle2) * y + math.sin(angle2) * z
-            return u + v
+            local angle = h_norm * 6.28318530718 -- 2*PI
+            local cos_a = math.cos(angle)
+            local sin_a = math.sin(angle)
+            return cos_a * x + sin_a * y + (cos_a * 0.707106781 + sin_a * 0.707106781) * z
         end
 
         -- Inline Perlin Noise 3D（使用浮點座標）
@@ -628,30 +544,29 @@ function Process(req)
             )
         end
 
-        -- 根據 NoiseType 選擇 noise
+        -- Optimized noise type selection with precomputed scales
         if NoiseType == 0 then
             -- Perlin Noise
             noiseValue = localPerlinNoise3D(posX * Scale, posY * Scale, posZ * Scale)
         elseif NoiseType == 1 then
-            -- Simplex Noise (簡化，用 Perlin 近似對角線方向)
-            local s = 0.707106781
+            -- Simplex Noise (simplified, using Perlin approximation)
+            local s = 0.707106781 -- sqrt(0.5) for Simplex
             noiseValue = localPerlinNoise3D(posX * Scale * s, posY * Scale * s, posZ * Scale * s)
         elseif NoiseType == 2 then
             -- Value Noise
             noiseValue = localValueNoise3D(posX * Scale, posY * Scale, posZ * Scale)
         elseif NoiseType == 3 then
-            -- Worley Noise（cellular）
+            -- Worley Noise (cellular) - optimized with distance squared
             local sx = posX * Scale
             local sy = posY * Scale
             local sz = posZ * Scale
             local cellX = math.floor(sx)
             local cellY = math.floor(sy)
             local cellZ = math.floor(sz)
-            local minDist = math.huge
+            local minDistSq = math.huge
             for k = -1, 1 do
                 for j = -1, 1 do
                     for i = -1, 1 do
-                        -- Use float coordinates directly
                         local neighborX = cellX + i
                         local neighborY = cellY + j
                         local neighborZ = cellZ + k
@@ -661,24 +576,28 @@ function Process(req)
                         local dx = sx - pointX
                         local dy = sy - pointY
                         local dz = sz - pointZ
-                        local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-                        if dist < minDist then
-                            minDist = dist
+                        local distSq = dx * dx + dy * dy + dz * dz
+                        if distSq < minDistSq then
+                            minDistSq = distSq
                         end
                     end
                 end
             end
-            noiseValue = minDist * 2.0 - 1.0
+            -- Only calculate sqrt once at the end
+            noiseValue = math.sqrt(minDistSq) * 2.0 - 1.0
         elseif NoiseType == 4 then
-            -- FBM（使用 Perlin 組合）
+            -- FBM (Fractal Brownian Motion) - optimized loop
             local value = 0.0
             local amplitude = 1.0
             local frequency = 1.0
             local maxValue = 0.0
+            local posX_scaled = posX * Scale
+            local posY_scaled = posY * Scale
+            local posZ_scaled = posZ * Scale
             for i = 0, Octaves - 1 do
                 value = value +
-                    localPerlinNoise3D(posX * Scale * frequency, posY * Scale * frequency,
-                        posZ * Scale * frequency) * amplitude
+                    localPerlinNoise3D(posX_scaled * frequency, posY_scaled * frequency, posZ_scaled * frequency) *
+                    amplitude
                 maxValue = maxValue + amplitude
                 amplitude = amplitude * Persistence
                 frequency = frequency * Lacunarity
@@ -689,34 +608,24 @@ function Process(req)
             noiseValue = localPerlinNoise3D(posX * Scale, posY * Scale, posZ * Scale)
         end
 
-        if x == DWleft and y == DWbottom then
-            print("Noise3D_mijo: Generated noise value = " .. tostring(noiseValue))
-        end
-
         -- Normalize from [-1, 1] to [0, 1] if needed, then remap to [minValue, maxValue]
         noiseValue = (noiseValue + 1.0) * 0.5
         noiseValue = localLerp(MinValue, MaxValue, noiseValue)
 
-        -- Clamp to valid range
-        noiseValue = math.max(0.0, math.min(1.0, noiseValue))
+        -- Clamp to valid range (optimized single-line clamp)
+        noiseValue = noiseValue < 0.0 and 0.0 or (noiseValue > 1.0 and 1.0 or noiseValue)
 
         -- Set output pixel (grayscale noise)
-        -- p parameter contains source image values, so we can read alpha from it
         p.R = noiseValue
         p.G = noiseValue
         p.B = noiseValue
-        -- Keep original alpha from source image
-        -- p.A should already contain the source image alpha value from MultiProcessPixels
+        -- Alpha is preserved automatically by MultiProcessPixels
 
         return p
     end
 
-    -- Prepare userData - keys will be injected as globals in processPixel function.
-    -- We also pass the top‑level helper functions we want to use (getNoiseValue, lerp)
-    -- because the pixel-processing environment is reconstructed from this table.
+    -- Prepare userData - keys will be injected as globals in processPixel function
     local userData = {
-        getNoiseValue = getNoiseValue,
-        lerp = lerp,
         OffsetX = offsetX,
         OffsetY = offsetY,
         OffsetZ = offsetZ,
@@ -729,15 +638,8 @@ function Process(req)
         MaxValue = maxValue,
     }
 
-    -- Use MultiProcessPixels to process all pixels
-    -- Use img_temp as source to ensure p parameter contains correct source values
-    -- This is especially important for green channel which was having issues
-    print("Noise3D_mijo: Calling MultiProcessPixels with source img_temp, destination out")
-    print("Noise3D_mijo: Using temporary image to ensure correct source pixel values")
+    -- Use MultiProcessPixels to process all pixels (automatically multi-threaded by Fusion)
     out:MultiProcessPixels(nil, userData, DWleft, DWbottom, width, height, img_temp, processPixel)
-    print("Noise3D_mijo: MultiProcessPixels completed")
 
-    print("Noise3D_mijo: Setting output...")
     OutImage:Set(req, out)
-    print("Noise3D_mijo: Process() completed")
 end
