@@ -42,6 +42,28 @@ function Create()
         INP_Default = 1.0,
     })
 
+    -- Scale X/Y/Z parameters
+    InScaleX = self:AddInput("Scale X", "ScaleX", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 1.0,
+    })
+
+    InScaleY = self:AddInput("Scale Y", "ScaleY", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 1.0,
+    })
+
+    InScaleZ = self:AddInput("Scale Z", "ScaleZ", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 1.0,
+    })
+
     -- Octaves for FBM
     InOctaves = self:AddInput("Octaves", "Octaves", {
         INPID_InputControl = "SliderControl",
@@ -86,6 +108,22 @@ function Create()
         INPID_InputControl = "SliderControl",
         INP_MinScale = -10.0,
         INP_MaxScale = 10.0,
+        INP_Default = 0.0,
+    })
+
+    -- Seethe (animation intensity)
+    InSeethe = self:AddInput("Seethe", "Seethe", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 0.0,
+    })
+
+    -- Seethe Rate (animation speed)
+    InSeetheRate = self:AddInput("Seethe Rate", "SeetheRate", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
         INP_Default = 0.0,
     })
 
@@ -352,14 +390,22 @@ function Process(req)
     local inputDepth = img.Depth
     local noiseType = InNoiseType:GetValue(req).Value
     local scale = InScale:GetValue(req).Value
+    local scaleX = InScaleX:GetValue(req).Value
+    local scaleY = InScaleY:GetValue(req).Value
+    local scaleZ = InScaleZ:GetValue(req).Value
     local octaves = InOctaves:GetValue(req).Value
     local lacunarity = InLacunarity:GetValue(req).Value
     local persistence = InPersistence:GetValue(req).Value
     local offsetX = InOffsetX:GetValue(req).Value
     local offsetY = InOffsetY:GetValue(req).Value
     local offsetZ = InOffsetZ:GetValue(req).Value
+    local seethe = InSeethe:GetValue(req).Value
+    local seetheRate = InSeetheRate:GetValue(req).Value
     local minValue = InMinValue:GetValue(req).Value
     local maxValue = InMaxValue:GetValue(req).Value
+
+    -- Get current time for animation
+    local currentTime = req.Time or 0.0
 
     -- Get DataWindow and RoI
     local dod = req:GetInputDoD(InImage)
@@ -544,22 +590,28 @@ function Process(req)
             )
         end
 
+        -- Calculate time offset for animation (only used for noise types that support animation)
+        local timeOffset = CurrentTime * SeetheRate + Seethe
+
         -- Optimized noise type selection with precomputed scales
         if NoiseType == 0 then
-            -- Perlin Noise
-            noiseValue = localPerlinNoise3D(posX * Scale, posY * Scale, posZ * Scale)
+            -- Perlin Noise (supports animation)
+            noiseValue = localPerlinNoise3D(posX * Scale * ScaleX, posY * Scale * ScaleY,
+                (posZ + timeOffset) * Scale * ScaleZ)
         elseif NoiseType == 1 then
-            -- Simplex Noise (simplified, using Perlin approximation)
+            -- Simplex Noise (simplified, using Perlin approximation) (supports animation)
             local s = 0.707106781 -- sqrt(0.5) for Simplex
-            noiseValue = localPerlinNoise3D(posX * Scale * s, posY * Scale * s, posZ * Scale * s)
+            noiseValue = localPerlinNoise3D(posX * Scale * ScaleX * s, posY * Scale * ScaleY * s,
+                (posZ + timeOffset) * Scale * ScaleZ * s)
         elseif NoiseType == 2 then
-            -- Value Noise
-            noiseValue = localValueNoise3D(posX * Scale, posY * Scale, posZ * Scale)
+            -- Value Noise (supports animation)
+            noiseValue = localValueNoise3D(posX * Scale * ScaleX, posY * Scale * ScaleY,
+                (posZ + timeOffset) * Scale * ScaleZ)
         elseif NoiseType == 3 then
             -- Worley Noise (cellular) - optimized with distance squared
-            local sx = posX * Scale
-            local sy = posY * Scale
-            local sz = posZ * Scale
+            local sx = posX * Scale * ScaleX
+            local sy = posY * Scale * ScaleY
+            local sz = posZ * Scale * ScaleZ
             local cellX = math.floor(sx)
             local cellY = math.floor(sy)
             local cellZ = math.floor(sz)
@@ -586,14 +638,14 @@ function Process(req)
             -- Only calculate sqrt once at the end
             noiseValue = math.sqrt(minDistSq) * 2.0 - 1.0
         elseif NoiseType == 4 then
-            -- FBM (Fractal Brownian Motion) - optimized loop
+            -- FBM (Fractal Brownian Motion) - optimized loop (supports animation)
             local value = 0.0
             local amplitude = 1.0
             local frequency = 1.0
             local maxValue = 0.0
-            local posX_scaled = posX * Scale
-            local posY_scaled = posY * Scale
-            local posZ_scaled = posZ * Scale
+            local posX_scaled = posX * Scale * ScaleX
+            local posY_scaled = posY * Scale * ScaleY
+            local posZ_scaled = (posZ + timeOffset) * Scale * ScaleZ
             for i = 0, Octaves - 1 do
                 value = value +
                     localPerlinNoise3D(posX_scaled * frequency, posY_scaled * frequency, posZ_scaled * frequency) *
@@ -604,8 +656,9 @@ function Process(req)
             end
             noiseValue = value / maxValue
         else
-            -- Default to Perlin
-            noiseValue = localPerlinNoise3D(posX * Scale, posY * Scale, posZ * Scale)
+            -- Default to Perlin (supports animation)
+            noiseValue = localPerlinNoise3D(posX * Scale * ScaleX, posY * Scale * ScaleY,
+                (posZ + timeOffset) * Scale * ScaleZ)
         end
 
         -- Normalize from [-1, 1] to [0, 1] if needed, then remap to [minValue, maxValue]
@@ -631,6 +684,12 @@ function Process(req)
         OffsetZ = offsetZ,
         NoiseType = noiseType,
         Scale = scale,
+        ScaleX = scaleX,
+        ScaleY = scaleY,
+        ScaleZ = scaleZ,
+        Seethe = seethe,
+        SeetheRate = seetheRate,
+        CurrentTime = currentTime,
         Octaves = octaves,
         Lacunarity = lacunarity,
         Persistence = persistence,
