@@ -112,13 +112,14 @@ end
 -- Hash function for pseudo-random values
 -- Using mathematical operations for compatibility
 function hash(n)
+    -- Handle negative values properly for hash consistency
     local n_int = math.floor(n)
-    -- Simulate bit operations with math
-    n_int = (n_int * 8192) % 2147483647 -- lshift by 13
-    n_int = math.floor(n_int) % 2147483647
+    -- Ensure n_int is positive for modulo operations
+    -- Use double modulo to handle negative values correctly
+    n_int = ((n_int * 8192) % 2147483647 + 2147483647) % 2147483647
+    n_int = math.floor(n_int)
     local result = (n_int * (n_int * n_int * 15731 + 789221) + 1376312589)
-    result = result % 2147483647 -- bit.band with 0x7fffffff
-    if result < 0 then result = result + 2147483647 end
+    result = ((result % 2147483647) + 2147483647) % 2147483647
     return (1.0 - result / 1073741824.0)
 end
 
@@ -153,9 +154,16 @@ end
 
 -- Perlin Noise 3D
 function perlinNoise3D(x, y, z)
-    local X = math.floor(x) % 256
-    local Y = math.floor(y) % 256
-    local Z = math.floor(z) % 256
+    -- Handle negative coordinates properly for modulo operation
+    -- ((n % 256) + 256) % 256 ensures result is always positive [0, 255]
+    local X = ((math.floor(x) % 256) + 256) % 256
+    local Y = ((math.floor(y) % 256) + 256) % 256
+    local Z = ((math.floor(z) % 256) + 256) % 256
+
+    -- Calculate neighbor coordinates with proper modulo wrapping
+    local X1 = (X + 1) % 256
+    local Y1 = (Y + 1) % 256
+    local Z1 = (Z + 1) % 256
 
     x = x - math.floor(x)
     y = y - math.floor(y)
@@ -166,13 +174,13 @@ function perlinNoise3D(x, y, z)
     local w = fade(z)
 
     local h000 = hash3(X, Y, Z)
-    local h001 = hash3(X, Y, Z + 1)
-    local h010 = hash3(X, Y + 1, Z)
-    local h011 = hash3(X, Y + 1, Z + 1)
-    local h100 = hash3(X + 1, Y, Z)
-    local h101 = hash3(X + 1, Y, Z + 1)
-    local h110 = hash3(X + 1, Y + 1, Z)
-    local h111 = hash3(X + 1, Y + 1, Z + 1)
+    local h001 = hash3(X, Y, Z1)
+    local h010 = hash3(X, Y1, Z)
+    local h011 = hash3(X, Y1, Z1)
+    local h100 = hash3(X1, Y, Z)
+    local h101 = hash3(X1, Y, Z1)
+    local h110 = hash3(X1, Y1, Z)
+    local h111 = hash3(X1, Y1, Z1)
 
     local AAA = grad3(h000, x, y, z)
     local ABA = grad3(h001, x, y, z - 1)
@@ -206,9 +214,16 @@ end
 
 -- Value Noise 3D
 function valueNoise3D(x, y, z)
-    local X = math.floor(x) % 256
-    local Y = math.floor(y) % 256
-    local Z = math.floor(z) % 256
+    -- Handle negative coordinates properly for modulo operation
+    -- ((n % 256) + 256) % 256 ensures result is always positive [0, 255]
+    local X = ((math.floor(x) % 256) + 256) % 256
+    local Y = ((math.floor(y) % 256) + 256) % 256
+    local Z = ((math.floor(z) % 256) + 256) % 256
+
+    -- Calculate neighbor coordinates with proper modulo wrapping
+    local X1 = (X + 1) % 256
+    local Y1 = (Y + 1) % 256
+    local Z1 = (Z + 1) % 256
 
     x = x - math.floor(x)
     y = y - math.floor(y)
@@ -219,13 +234,13 @@ function valueNoise3D(x, y, z)
     local w = fade(z)
 
     local a = hash3(X, Y, Z)
-    local b = hash3(X + 1, Y, Z)
-    local c = hash3(X, Y + 1, Z)
-    local d = hash3(X + 1, Y + 1, Z)
-    local e = hash3(X, Y, Z + 1)
-    local f = hash3(X + 1, Y, Z + 1)
-    local g = hash3(X, Y + 1, Z + 1)
-    local h = hash3(X + 1, Y + 1, Z + 1)
+    local b = hash3(X1, Y, Z)
+    local c = hash3(X, Y1, Z)
+    local d = hash3(X1, Y1, Z)
+    local e = hash3(X, Y, Z1)
+    local f = hash3(X1, Y, Z1)
+    local g = hash3(X, Y1, Z1)
+    local h = hash3(X1, Y1, Z1)
 
     return lerp(
         lerp(
@@ -330,6 +345,15 @@ function Process(req)
         return nil
     end
 
+    -- Check input image depth - important for preserving negative values
+    -- IMG_Depth_Float = 0, IMG_Depth_8 = 1, IMG_Depth_16 = 2
+    local inputDepth = img.Depth
+    print("Noise3D_mijo: Input image depth = " .. tostring(inputDepth) .. " (0=Float, 1=8bit, 2=16bit)")
+    if inputDepth ~= IMG_Depth_Float then
+        print("Noise3D_mijo: WARNING - Input image is not float depth! Negative values may be clipped.")
+        print("Noise3D_mijo: To preserve negative values, ensure input image is float depth (32-bit float)")
+    end
+
     print("Noise3D_mijo: Getting parameters...")
     local noiseType = InNoiseType:GetValue(req).Value
     local scale = InScale:GetValue(req).Value
@@ -352,12 +376,24 @@ function Process(req)
         datawnd = roi:Intersect(datawnd)
     end
 
-    local out = Image({
+    -- Create a temporary image to copy source data
+    -- This ensures we can read source pixel values correctly, especially green channel
+    local img_temp = Image({
         IMG_Like = img,
         IMG_DataWindow = datawnd,
         IMG_ValidWindow = roi and roi.ValidWindow,
         IMG_Depth = IMG_Depth_Float,
-        IMG_CopyChannels = true,
+        IMG_CopyChannels = true, -- Copy channels from source to ensure correct values
+    })
+    -- Copy source image data to temporary image
+    img:Crop(img_temp, {})
+
+    local out = Image({
+        IMG_Like = img_temp,
+        IMG_DataWindow = datawnd,
+        IMG_ValidWindow = roi and roi.ValidWindow,
+        IMG_Depth = IMG_Depth_Float,
+        IMG_NoData = true, -- Don't copy channels, we'll write our own values
     })
 
     -- Get image dimensions from DataWindow
@@ -373,38 +409,56 @@ function Process(req)
         tostring(DWleft) ..
         ", bottom=" .. tostring(DWbottom) .. ", right=" .. tostring(DWright) .. ", top=" .. tostring(DWtop))
 
-    -- Create a temporary image to read from input
-    local img_temp = Image({
-        IMG_Like = img,
-        IMG_DataWindow = datawnd,
-        IMG_ValidWindow = roi and roi.ValidWindow,
-        IMG_Depth = IMG_Depth_Float,
-        IMG_CopyChannels = true,
-    })
-    img:Crop(img_temp, {})
-
     -- Process pixels using MultiProcessPixels
     -- Define function BEFORE creating userData, similar to Grade.fuse
+    -- Read directly from input image - use p parameter but also try direct read as fallback
     local function processPixel(x, y, p)
-        -- Debug: Print first pixel info
+        -- p parameter from MultiProcessPixels contains pixel values from source image (img)
+        -- In MultiProcessPixels, p comes from the source image specified in the call
+        -- Since we pass 'img' as the source, p should contain values from img
+        -- However, to ensure we get the correct values, especially for green channel,
+        -- we use p directly as it should contain the source image pixel values
+        local inputPixel = p
+
+        -- Debug: Print first pixel info and compare values
+        -- Check green channel specifically to debug the stretching issue
         if x == DWleft and y == DWbottom then
             print("Noise3D_mijo: Processing first pixel at (" .. tostring(x) .. ", " .. tostring(y) .. ")")
-            print("Noise3D_mijo: Input RGB = (" .. tostring(p.R) .. ", " .. tostring(p.G) .. ", " .. tostring(p.B) .. ")")
+            print("Noise3D_mijo: Input RGB from source image (p parameter) = (" ..
+                tostring(inputPixel.R) .. ", " .. tostring(inputPixel.G) .. ", " .. tostring(inputPixel.B) .. ")")
+            print("Noise3D_mijo: Green channel (G) = " .. tostring(inputPixel.G))
             print("Noise3D_mijo: OffsetX = " ..
                 tostring(OffsetX) .. ", OffsetY = " .. tostring(OffsetY) .. ", OffsetZ = " .. tostring(OffsetZ))
             print("Noise3D_mijo: NoiseType = " .. tostring(NoiseType) .. ", Scale = " .. tostring(Scale))
         end
 
         -- Extract RGB as XYZ position from input pixel
-        -- Access variables from userData (injected as globals by MultiProcessPixels)
-        local posX = p.R + OffsetX
-        local posY = p.G + OffsetY
-        local posZ = p.B + OffsetZ
+        -- Read directly from source image to preserve original values, especially green channel
+        -- If source image is float depth, negative values should be preserved
+        local posX = inputPixel.R + OffsetX
+        local posY = inputPixel.G + OffsetY
+        local posZ = inputPixel.B + OffsetZ
 
         -- Scale position
         local scaledX = posX * Scale
         local scaledY = posY * Scale
         local scaledZ = posZ * Scale
+
+        -- Debug: Print position values for first pixel and check for negative values
+        -- Focus on green channel (Y coordinate) to debug the stretching issue
+        if x == DWleft and y == DWbottom then
+            print("Noise3D_mijo: Position XYZ = (" ..
+                tostring(posX) .. ", " .. tostring(posY) .. ", " .. tostring(posZ) .. ")")
+            print("Noise3D_mijo: Scaled XYZ = (" ..
+                tostring(scaledX) .. ", " .. tostring(scaledY) .. ", " .. tostring(scaledZ) .. ")")
+            print("Noise3D_mijo: Green channel details - inputPixel.G = " .. tostring(inputPixel.G) ..
+                ", OffsetY = " .. tostring(OffsetY) .. ", posY = " .. tostring(posY) ..
+                ", Scale = " .. tostring(Scale) .. ", scaledY = " .. tostring(scaledY))
+            -- Check specifically for green channel negative values
+            if inputPixel.G < 0 then
+                print("Noise3D_mijo: WARNING - Green channel has negative value: " .. tostring(inputPixel.G))
+            end
+        end
 
         -- Generate noise value based on NoiseType
         -- Inline implementation to avoid function access issues
@@ -420,16 +474,22 @@ function Process(req)
         end
 
         local function localHash(n)
+            -- Handle negative values properly for hash consistency
+            -- Use the same implementation as the top-level hash function for consistency
             local n_int = math.floor(n)
-            n_int = (n_int * 8192) % 2147483647
-            n_int = math.floor(n_int) % 2147483647
+            -- Ensure n_int is positive for modulo operations
+            -- Use double modulo to handle negative values correctly
+            n_int = ((n_int * 8192) % 2147483647 + 2147483647) % 2147483647
+            n_int = math.floor(n_int)
             local result = (n_int * (n_int * n_int * 15731 + 789221) + 1376312589)
-            result = result % 2147483647
-            if result < 0 then result = result + 2147483647 end
+            result = ((result % 2147483647) + 2147483647) % 2147483647
             return (1.0 - result / 1073741824.0)
         end
 
         local function localHash3(x, y, z)
+            -- Ensure coordinates are integers and handle negative values properly
+            -- Convert to integers first, handling negative values correctly
+            -- Use the same approach as the top-level hash3 function for consistency
             local n = math.floor(x) + math.floor(y) * 57 + math.floor(z) * 131
             return localHash(n)
         end
@@ -445,9 +505,16 @@ function Process(req)
 
         -- Inline Perlin Noise 3D
         local function localPerlinNoise3D(x, y, z)
-            local X = math.floor(x) % 256
-            local Y = math.floor(y) % 256
-            local Z = math.floor(z) % 256
+            -- Handle negative coordinates properly for modulo operation
+            -- ((n % 256) + 256) % 256 ensures result is always positive [0, 255]
+            local X = ((math.floor(x) % 256) + 256) % 256
+            local Y = ((math.floor(y) % 256) + 256) % 256
+            local Z = ((math.floor(z) % 256) + 256) % 256
+
+            -- Calculate neighbor coordinates with proper modulo wrapping
+            local X1 = (X + 1) % 256
+            local Y1 = (Y + 1) % 256
+            local Z1 = (Z + 1) % 256
 
             x = x - math.floor(x)
             y = y - math.floor(y)
@@ -458,13 +525,13 @@ function Process(req)
             local w = localFade(z)
 
             local h000 = localHash3(X, Y, Z)
-            local h001 = localHash3(X, Y, Z + 1)
-            local h010 = localHash3(X, Y + 1, Z)
-            local h011 = localHash3(X, Y + 1, Z + 1)
-            local h100 = localHash3(X + 1, Y, Z)
-            local h101 = localHash3(X + 1, Y, Z + 1)
-            local h110 = localHash3(X + 1, Y + 1, Z)
-            local h111 = localHash3(X + 1, Y + 1, Z + 1)
+            local h001 = localHash3(X, Y, Z1)
+            local h010 = localHash3(X, Y1, Z)
+            local h011 = localHash3(X, Y1, Z1)
+            local h100 = localHash3(X1, Y, Z)
+            local h101 = localHash3(X1, Y, Z1)
+            local h110 = localHash3(X1, Y1, Z)
+            local h111 = localHash3(X1, Y1, Z1)
 
             local AAA = localGrad3(h000, x, y, z)
             local ABA = localGrad3(h001, x, y, z - 1)
@@ -492,9 +559,16 @@ function Process(req)
 
         -- Inline Value Noise 3D
         local function localValueNoise3D(x, y, z)
-            local X = math.floor(x) % 256
-            local Y = math.floor(y) % 256
-            local Z = math.floor(z) % 256
+            -- Handle negative coordinates properly for modulo operation
+            -- ((n % 256) + 256) % 256 ensures result is always positive [0, 255]
+            local X = ((math.floor(x) % 256) + 256) % 256
+            local Y = ((math.floor(y) % 256) + 256) % 256
+            local Z = ((math.floor(z) % 256) + 256) % 256
+
+            -- Calculate neighbor coordinates with proper modulo wrapping
+            local X1 = (X + 1) % 256
+            local Y1 = (Y + 1) % 256
+            local Z1 = (Z + 1) % 256
 
             x = x - math.floor(x)
             y = y - math.floor(y)
@@ -505,13 +579,13 @@ function Process(req)
             local w = localFade(z)
 
             local a = localHash3(X, Y, Z)
-            local b = localHash3(X + 1, Y, Z)
-            local c = localHash3(X, Y + 1, Z)
-            local d = localHash3(X + 1, Y + 1, Z)
-            local e = localHash3(X, Y, Z + 1)
-            local f = localHash3(X + 1, Y, Z + 1)
-            local g = localHash3(X, Y + 1, Z + 1)
-            local h = localHash3(X + 1, Y + 1, Z + 1)
+            local b = localHash3(X1, Y, Z)
+            local c = localHash3(X, Y1, Z)
+            local d = localHash3(X1, Y1, Z)
+            local e = localHash3(X, Y, Z1)
+            local f = localHash3(X1, Y, Z1)
+            local g = localHash3(X, Y1, Z1)
+            local h = localHash3(X1, Y1, Z1)
 
             return localLerp(
                 localLerp(
@@ -595,11 +669,12 @@ function Process(req)
         noiseValue = math.max(0.0, math.min(1.0, noiseValue))
 
         -- Set output pixel (grayscale noise)
+        -- p parameter contains source image values, so we can read alpha from it
         p.R = noiseValue
         p.G = noiseValue
         p.B = noiseValue
-        -- Keep original alpha
-        -- p.A remains unchanged
+        -- Keep original alpha from source image
+        -- p.A should already contain the source image alpha value from MultiProcessPixels
 
         return p
     end
@@ -620,8 +695,10 @@ function Process(req)
     }
 
     -- Use MultiProcessPixels to process all pixels
-    -- Process img_temp and write to out
+    -- Use img_temp as source to ensure p parameter contains correct source values
+    -- This is especially important for green channel which was having issues
     print("Noise3D_mijo: Calling MultiProcessPixels with source img_temp, destination out")
+    print("Noise3D_mijo: Using temporary image to ensure correct source pixel values")
     out:MultiProcessPixels(nil, userData, DWleft, DWbottom, width, height, img_temp, processPixel)
     print("Noise3D_mijo: MultiProcessPixels completed")
 
