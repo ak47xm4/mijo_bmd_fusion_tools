@@ -1,0 +1,264 @@
+-- fill_pixels_mijo.fuse
+-- by mijo
+-- 2025-11-28
+-- Re:Fill style image inpainting tool for Fusion
+
+FuRegisterClass("FillPixels_mijo", CT_Tool, {
+    REGS_Name = "Fill Pixels mijo",
+    REGS_Category = "mijo",
+    REGS_OpIconString = "Fill",
+    REGS_OpDescription = "Fill damaged/missing areas using surrounding pixels (Re:Fill style)",
+    REG_OpNoMask = true,
+    REG_OpNoBlendCtrls = true,
+    REG_NoObjMatCtrls = true,
+    REG_NoMotionBlurCtrls = true,
+})
+
+function Create()
+    InImage = self:AddInput("Input", "Input", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    InMask = self:AddInput("Mask", "Mask", {
+        LINKID_DataType = "Image",
+        LINK_Main = 2,
+        INP_Required = false,
+    })
+
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    InFillMethod = self:AddInput("Fill Method", "FillMethod", {
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0.0,
+        INP_Integer = true,
+        { CCS_AddString = "Average (Fast)" },
+        INP_MaxScale = 0.0,
+        INP_MinScale = 0.0,
+    })
+
+    InSearchRadius = self:AddInput("Search Radius", "SearchRadius", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 1.0,
+        INP_MaxScale = 200.0,
+        INP_Default = 20.0,
+        INP_Integer = true,
+    })
+
+    InMaskThreshold = self:AddInput("Mask Threshold", "MaskThreshold", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 0.5,
+    })
+
+    InUseAlphaAsMask = self:AddInput("Use Alpha as Mask", "UseAlphaAsMask", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 0,
+    })
+
+    InIterations = self:AddInput("Iterations", "Iterations", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 1.0,
+        INP_MaxScale = 20.0,
+        INP_Default = 5.0,
+        INP_Integer = true,
+    })
+
+    InTestMode = self:AddInput("TEST MODE (Red Fill)", "TestMode", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 0,
+    })
+
+    InDebugOutput = self:AddInput("DEBUG Output Mode", "DebugOutput", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 0,
+        { CCS_AddString = "Normal", },
+        { CCS_AddString = "Original Masked", },
+        { CCS_AddString = "Diffused Masked", },
+        { CCS_AddString = "Mask Only", },
+    })
+end
+
+-- PIXEL FUNCTIONS
+local function p_MakeMask(x, y, p)
+    -- Globals: Threshold, UseAlpha
+    local val = 0.0
+    if UseAlpha > 0.5 then
+        val = 1.0 - p.A
+    else
+        val = (p.R + p.G + p.B) / 3.0
+    end
+
+    if val >= Threshold then
+        val = 1.0
+    else
+        val = 0.0
+    end
+
+    p.R = val; p.G = val; p.B = val; p.A = 1.0
+    return p
+end
+
+local function p_Copy(x, y, p)
+    return p
+end
+
+local function p_Red(x, y, p)
+    p.R = 1.0; p.G = 0.0; p.B = 0.0; p.A = 1.0
+    return p
+end
+
+function Process(req)
+    local img = InImage:GetValue(req)
+    if not img then return end
+
+    local maskImg = nil
+    pcall(function() maskImg = InMask:GetValue(req) end)
+
+    local searchRadius = InSearchRadius:GetValue(req).Value
+    local maskThreshold = InMaskThreshold:GetValue(req).Value
+    local useAlpha = InUseAlphaAsMask:GetValue(req).Value
+    local iterations = InIterations:GetValue(req).Value
+    local testMode = InTestMode:GetValue(req).Value
+    local debugOutput = InDebugOutput:GetValue(req).Value
+
+    local dod = req:GetInputDoD(InImage)
+    local datawnd = dod:Intersect(img.DataWindow)
+    local width = datawnd.right - datawnd.left
+    local height = datawnd.top - datawnd.bottom
+
+    -- Helper to create empty image
+    local function createEmpty(src)
+        return Image({
+            IMG_Document = self.Comp,
+            IMG_Like = src,
+            IMG_DataWindow = datawnd,
+            IMG_Depth = src.Depth,
+            IMG_CopyChannels = false,
+        })
+    end
+
+    -- Explicit Copy Helper using MPP
+    local function copyImg(src)
+        local out = createEmpty(src)
+        -- Use MultiProcessPixels to copy data
+        out:MultiProcessPixels(nil, {}, 0, 0, width, height, src, p_Copy)
+        return out
+    end
+
+    if testMode > 0.5 then
+        local t = createEmpty(img)
+        t:MultiProcessPixels(nil, {}, 0, 0, width, height, img, p_Red)
+        OutImage:Set(req, t)
+        return
+    end
+
+    -- 1. Prepare Mask using MPP
+    local mask_src = (useAlpha > 0.5) and img or (maskImg or img)
+    local mask_normalized = createEmpty(img)
+    local udMask = { Threshold = maskThreshold, UseAlpha = (useAlpha > 0.5) and 1.0 or 0.0 }
+    mask_normalized:MultiProcessPixels(nil, udMask, 0, 0, width, height, mask_src, p_MakeMask)
+
+    if debugOutput == 3 then
+        OutImage:Set(req, mask_normalized)
+        return
+    end
+
+    -- 2. Main Loop
+    local current_img = copyImg(img)  -- Explicit copy
+    local original_img = copyImg(img) -- Explicit copy
+
+    for iter = 1, iterations do
+        -- A. Diffusion using Resize
+        local diffused = copyImg(current_img) -- Explicit copy
+        local scale = 1.0 / math.max(1.0, searchRadius / math.max(1, iter))
+        local small_w = math.max(1, math.floor(width * scale))
+        local small_h = math.max(1, math.floor(height * scale))
+
+        local small = Image({
+            IMG_Document = self.Comp,
+            IMG_Like = diffused,
+            IMG_Width = small_w,
+            IMG_Height = small_h,
+            IMG_Depth = diffused.Depth,
+            IMG_CopyChannels = false,
+        })
+        -- Use standard Resize (hope it works with empty target)
+        diffused:Resize(small) -- Downscale to small
+        small:Resize(diffused) -- Upscale back to diffused
+
+        -- B. BLENDING using SLOW LUA LOOP
+        local p_orig = Pixel()
+        local p_diff = Pixel()
+        local p_mask = Pixel()
+        local p_out = Pixel()
+
+        if (debugOutput == 1 or debugOutput == 2) and iter == 1 then
+            local debug_out = createEmpty(img)
+            for y = datawnd.bottom, datawnd.top - 1 do
+                for x = datawnd.left, datawnd.right - 1 do
+                    original_img:GetPixel(x, y, p_orig)
+                    diffused:GetPixel(x, y, p_diff)
+                    mask_normalized:GetPixel(x, y, p_mask)
+
+                    local m = p_mask.R
+
+                    if debugOutput == 1 then -- Orig Masked
+                        -- Check if p_orig is black (it shouldn't be now)
+                        p_out.R = p_orig.R * (1.0 - m)
+                        p_out.G = p_orig.G * (1.0 - m)
+                        p_out.B = p_orig.B * (1.0 - m)
+                        p_out.A = 1.0
+                    else -- Diffused Masked
+                        p_out.R = p_diff.R * m
+                        p_out.G = p_diff.G * m
+                        p_out.B = p_diff.B * m
+                        p_out.A = 1.0
+                    end
+                    debug_out:SetPixel(x, y, p_out)
+                end
+            end
+            OutImage:Set(req, debug_out)
+            return
+        end
+
+        -- Normal Blending Loop
+        -- Blend directly into diffused
+        for y = datawnd.bottom, datawnd.top - 1 do
+            for x = datawnd.left, datawnd.right - 1 do
+                mask_normalized:GetPixel(x, y, p_mask)
+                local m = p_mask.R
+
+                if m < 0.001 then
+                    original_img:GetPixel(x, y, p_orig)
+                    diffused:SetPixel(x, y, p_orig)
+                elseif m > 0.999 then
+                    -- Keep diffused pixel
+                else
+                    original_img:GetPixel(x, y, p_orig)
+                    diffused:GetPixel(x, y, p_diff)
+
+                    p_out.R = p_orig.R * (1.0 - m) + p_diff.R * m
+                    p_out.G = p_orig.G * (1.0 - m) + p_diff.G * m
+                    p_out.B = p_orig.B * (1.0 - m) + p_diff.B * m
+                    p_out.A = 1.0
+                    diffused:SetPixel(x, y, p_out)
+                end
+            end
+        end
+
+        current_img = diffused
+    end
+
+    OutImage:Set(req, current_img)
+end
