@@ -1,0 +1,886 @@
+-- Noise 3D mijo
+-- OpenCL GPU Accelerated version
+-- All noise computation runs on the GPU via OpenCL kernels
+-- Falls back to CPU (MultiProcessPixels) if OpenCL is unavailable
+
+-- ============================================================================
+-- OpenCL Kernel Source
+-- ============================================================================
+clsource = [[
+
+// ---------------------------------------------------------------------------
+// Hash functions
+// ---------------------------------------------------------------------------
+float cl_hash(float n) {
+    float n_scaled = n * 12.9898f;
+    float h = sin(n_scaled) * 43758.5453f;
+    float result = h - floor(h);
+    return result * 2.0f - 1.0f;
+}
+
+float cl_hash3(float x, float y, float z) {
+    float n = x * 12.9898f + y * 78.233f + z * 43758.5453f;
+    return cl_hash(n);
+}
+
+// ---------------------------------------------------------------------------
+// Interpolation helpers
+// ---------------------------------------------------------------------------
+float cl_fade(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+float cl_lerp(float a, float b, float t) {
+    return a + t * (b - a);
+}
+
+// ---------------------------------------------------------------------------
+// Gradient function
+// ---------------------------------------------------------------------------
+float cl_grad3(float hash_val, float x, float y, float z) {
+    float h_norm = (hash_val + 1.0f) * 0.5f;
+    float angle = h_norm * 6.28318530718f;
+    float cos_a = cos(angle);
+    float sin_a = sin(angle);
+    return cos_a * x + sin_a * y + (cos_a * 0.707106781f + sin_a * 0.707106781f) * z;
+}
+
+// ---------------------------------------------------------------------------
+// Perlin Noise 3D
+// ---------------------------------------------------------------------------
+float perlinNoise3D(float x, float y, float z) {
+    float X = floor(x);
+    float Y = floor(y);
+    float Z = floor(z);
+
+    float fx = x - X;
+    float fy = y - Y;
+    float fz = z - Z;
+
+    float X1 = X + 1.0f;
+    float Y1 = Y + 1.0f;
+    float Z1 = Z + 1.0f;
+
+    float u = cl_fade(fx);
+    float v = cl_fade(fy);
+    float w = cl_fade(fz);
+
+    float h000 = cl_hash3(X, Y, Z);
+    float h001 = cl_hash3(X, Y, Z1);
+    float h010 = cl_hash3(X, Y1, Z);
+    float h011 = cl_hash3(X, Y1, Z1);
+    float h100 = cl_hash3(X1, Y, Z);
+    float h101 = cl_hash3(X1, Y, Z1);
+    float h110 = cl_hash3(X1, Y1, Z);
+    float h111 = cl_hash3(X1, Y1, Z1);
+
+    float AAA = cl_grad3(h000, fx, fy, fz);
+    float ABA = cl_grad3(h001, fx, fy, fz - 1.0f);
+    float AAB = cl_grad3(h010, fx, fy - 1.0f, fz);
+    float ABB = cl_grad3(h011, fx, fy - 1.0f, fz - 1.0f);
+    float BAA = cl_grad3(h100, fx - 1.0f, fy, fz);
+    float BBA = cl_grad3(h101, fx - 1.0f, fy, fz - 1.0f);
+    float BAB = cl_grad3(h110, fx - 1.0f, fy - 1.0f, fz);
+    float BBB = cl_grad3(h111, fx - 1.0f, fy - 1.0f, fz - 1.0f);
+
+    return cl_lerp(
+        cl_lerp(
+            cl_lerp(AAA, BAA, u),
+            cl_lerp(ABA, BBA, u),
+            w
+        ),
+        cl_lerp(
+            cl_lerp(AAB, BAB, u),
+            cl_lerp(ABB, BBB, u),
+            w
+        ),
+        v
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Value Noise 3D
+// ---------------------------------------------------------------------------
+float valueNoise3D(float x, float y, float z) {
+    float X = floor(x);
+    float Y = floor(y);
+    float Z = floor(z);
+
+    float fx = x - X;
+    float fy = y - Y;
+    float fz = z - Z;
+
+    float X1 = X + 1.0f;
+    float Y1 = Y + 1.0f;
+    float Z1 = Z + 1.0f;
+
+    float u = cl_fade(fx);
+    float v = cl_fade(fy);
+    float w = cl_fade(fz);
+
+    float a = cl_hash3(X, Y, Z);
+    float b = cl_hash3(X1, Y, Z);
+    float c = cl_hash3(X, Y1, Z);
+    float d = cl_hash3(X1, Y1, Z);
+    float e = cl_hash3(X, Y, Z1);
+    float f = cl_hash3(X1, Y, Z1);
+    float g = cl_hash3(X, Y1, Z1);
+    float h = cl_hash3(X1, Y1, Z1);
+
+    return cl_lerp(
+        cl_lerp(
+            cl_lerp(a, b, u),
+            cl_lerp(c, d, u),
+            v
+        ),
+        cl_lerp(
+            cl_lerp(e, f, u),
+            cl_lerp(g, h, u),
+            v
+        ),
+        w
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Worley Noise 3D (Cellular)
+// ---------------------------------------------------------------------------
+float worleyNoise3D(float x, float y, float z) {
+    float cellX = floor(x);
+    float cellY = floor(y);
+    float cellZ = floor(z);
+
+    float minDistSq = 1e20f;
+
+    for (int k = -1; k <= 1; k++) {
+        for (int j = -1; j <= 1; j++) {
+            for (int i = -1; i <= 1; i++) {
+                float neighborX = cellX + (float)i;
+                float neighborY = cellY + (float)j;
+                float neighborZ = cellZ + (float)k;
+
+                float pointX = neighborX + cl_hash3(neighborX, neighborY, neighborZ) * 0.5f + 0.25f;
+                float pointY = neighborY + cl_hash3(neighborX + 1.0f, neighborY, neighborZ) * 0.5f + 0.25f;
+                float pointZ = neighborZ + cl_hash3(neighborX, neighborY + 1.0f, neighborZ) * 0.5f + 0.25f;
+
+                float dx = x - pointX;
+                float dy = y - pointY;
+                float dz = z - pointZ;
+                float distSq = dx * dx + dy * dy + dz * dz;
+
+                if (distSq < minDistSq) {
+                    minDistSq = distSq;
+                }
+            }
+        }
+    }
+
+    return sqrt(minDistSq) * 2.0f - 1.0f;
+}
+
+// ---------------------------------------------------------------------------
+// FBM (Fractal Brownian Motion) using Perlin base
+// ---------------------------------------------------------------------------
+float fbmNoise3D(float x, float y, float z, int octaves, float lacunarity, float persistence) {
+    float value = 0.0f;
+    float amplitude = 1.0f;
+    float frequency = 1.0f;
+    float maxValue = 0.0f;
+
+    for (int i = 0; i < octaves; i++) {
+        value += perlinNoise3D(x * frequency, y * frequency, z * frequency) * amplitude;
+        maxValue += amplitude;
+        amplitude *= persistence;
+        frequency *= lacunarity;
+    }
+
+    return value / maxValue;
+}
+
+// ---------------------------------------------------------------------------
+// Unified noise generation with output remapping
+// ---------------------------------------------------------------------------
+float generateNoise(
+    float posX, float posY, float posZ,
+    float channelOffsetX, float channelOffsetY, float channelOffsetZ,
+    float timeOffset,
+    int noiseType, float scale, float scaleX, float scaleY, float scaleZ,
+    int octaves, float lacunarity, float persistence,
+    float minValue, float maxValue)
+{
+    float finalPosX = posX + channelOffsetX;
+    float finalPosY = posY + channelOffsetY;
+    float finalPosZ = posZ + channelOffsetZ + timeOffset;
+
+    float sx = finalPosX * scale * scaleX;
+    float sy = finalPosY * scale * scaleY;
+    float sz = finalPosZ * scale * scaleZ;
+
+    float noiseVal = 0.0f;
+
+    if (noiseType == 0) {
+        // Perlin Noise
+        noiseVal = perlinNoise3D(sx, sy, sz);
+    } else if (noiseType == 1) {
+        // Simplex Noise (Perlin approximation with sqrt(0.5) scaling)
+        float s = 0.707106781f;
+        noiseVal = perlinNoise3D(sx * s, sy * s, sz * s);
+    } else if (noiseType == 2) {
+        // Value Noise
+        noiseVal = valueNoise3D(sx, sy, sz);
+    } else if (noiseType == 3) {
+        // Worley Noise (Cellular)
+        noiseVal = worleyNoise3D(sx, sy, sz);
+    } else if (noiseType == 4) {
+        // FBM (Fractal Brownian Motion)
+        noiseVal = fbmNoise3D(sx, sy, sz, octaves, lacunarity, persistence);
+    } else {
+        // Default: Perlin
+        noiseVal = perlinNoise3D(sx, sy, sz);
+    }
+
+    // Normalize from [-1, 1] to [0, 1], then remap to [minValue, maxValue]
+    noiseVal = (noiseVal + 1.0f) * 0.5f;
+    noiseVal = cl_lerp(minValue, maxValue, noiseVal);
+
+    // Clamp to [0, 1]
+    noiseVal = clamp(noiseVal, 0.0f, 1.0f);
+
+    return noiseVal;
+}
+
+// ---------------------------------------------------------------------------
+// Main Kernel: reads RGB as XYZ position, computes noise, writes output
+// ---------------------------------------------------------------------------
+__kernel void Noise3DKernel(
+    FuReadImage_t src,
+    FuWriteImage_t dst,
+    int2 imgsize,
+    int noiseType,
+    int outputMode,
+    float scale,
+    float scaleX,
+    float scaleY,
+    float scaleZ,
+    int octaves,
+    float lacunarity,
+    float persistence,
+    float offsetX,
+    float offsetY,
+    float offsetZ,
+    float timeOffset,
+    float minValue,
+    float maxValue)
+{
+    int2 ipos = (int2)(get_global_id(1), get_global_id(0));
+
+    // Bounds check for safety
+    if (ipos.x >= imgsize.x || ipos.y >= imgsize.y) return;
+
+    // Read source pixel: RGB channels encode XYZ position
+    float4 pixel = FuReadImagef(src, ipos, imgsize);
+
+    float posX = pixel.x + offsetX;
+    float posY = pixel.y + offsetY;
+    float posZ = pixel.z + offsetZ;
+
+    float4 result;
+
+    if (outputMode == 1) {
+        // RGB mode: different noise per channel using spatial offsets
+        result.x = generateNoise(posX, posY, posZ,
+            100.0f, 50.0f, 25.0f, timeOffset,
+            noiseType, scale, scaleX, scaleY, scaleZ,
+            octaves, lacunarity, persistence, minValue, maxValue);
+        result.y = generateNoise(posX, posY, posZ,
+            200.0f, 100.0f, 50.0f, timeOffset,
+            noiseType, scale, scaleX, scaleY, scaleZ,
+            octaves, lacunarity, persistence, minValue, maxValue);
+        result.z = generateNoise(posX, posY, posZ,
+            300.0f, 150.0f, 75.0f, timeOffset,
+            noiseType, scale, scaleX, scaleY, scaleZ,
+            octaves, lacunarity, persistence, minValue, maxValue);
+    } else {
+        // Grayscale mode: same noise for all channels
+        float noiseVal = generateNoise(posX, posY, posZ,
+            0.0f, 0.0f, 0.0f, timeOffset,
+            noiseType, scale, scaleX, scaleY, scaleZ,
+            octaves, lacunarity, persistence, minValue, maxValue);
+        result.x = noiseVal;
+        result.y = noiseVal;
+        result.z = noiseVal;
+    }
+
+    // Preserve alpha from source
+    result.w = pixel.w;
+
+    FuWriteImagef(dst, ipos, imgsize, result);
+}
+
+]]
+
+-- ============================================================================
+-- Fuse Registration
+-- ============================================================================
+FuRegisterClass("Noise3D_mijo_CL", CT_Tool, {
+    REGS_Name = "Noise 3D mijo CL",
+    REGS_Category = "mijo",
+    REGS_OpIconString = "N3C",
+    REGS_OpDescription = "Convert RGB channels to XYZ position and generate noise (OpenCL GPU accelerated)",
+    REG_OpNoMask = true,
+    REG_OpNoBlendCtrls = true,
+    REG_NoObjMatCtrls = true,
+    REG_NoMotionBlurCtrls = true,
+})
+
+-- ============================================================================
+-- OpenCL Initialization / Cleanup
+-- ============================================================================
+function OnAddToFlow()
+    mgr = OCLManager()
+    if mgr then
+        local path = string.sub(debug.getinfo(1).source, 2)
+        prog = mgr:BuildCachedProgram("Noise3D_mijo_CL", path, clsource)
+    end
+end
+
+function OnRemoveFromFlow()
+    prog = nil
+    mgr = nil
+end
+
+-- ============================================================================
+-- UI Controls (identical to the CPU version)
+-- ============================================================================
+function Create()
+    InImage = self:AddInput("Input", "Input", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    -- Noise algorithm selection
+    InNoiseType = self:AddInput("Noise Type", "NoiseType", {
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0.0,
+        INP_Integer = true,
+        { CCS_AddString = "Perlin Noise" },
+        { CCS_AddString = "Simplex Noise" },
+        { CCS_AddString = "Value Noise" },
+        { CCS_AddString = "Worley Noise" },
+        { CCS_AddString = "FBM (Fractal Brownian Motion)" },
+        INP_MaxScale = 4.0,
+        INP_MinScale = 0.0,
+    })
+
+    -- Output mode selection
+    InOutputMode = self:AddInput("Output Mode", "OutputMode", {
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0.0,
+        INP_Integer = true,
+        { CCS_AddString = "Grayscale" },
+        { CCS_AddString = "RGB" },
+        INP_MaxScale = 1.0,
+        INP_MinScale = 0.0,
+    })
+
+    -- Scale/Size parameter
+    InScale = self:AddInput("Scale", "Scale", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 1.0,
+    })
+
+    -- Scale X/Y/Z parameters
+    InScaleX = self:AddInput("Scale X", "ScaleX", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 1.0,
+    })
+
+    InScaleY = self:AddInput("Scale Y", "ScaleY", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 1.0,
+    })
+
+    InScaleZ = self:AddInput("Scale Z", "ScaleZ", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 1.0,
+    })
+
+    -- Octaves for FBM
+    InOctaves = self:AddInput("Octaves", "Octaves", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 1.0,
+        INP_MaxScale = 8.0,
+        INP_Default = 4.0,
+        INP_Integer = true,
+    })
+
+    -- Lacunarity for FBM
+    InLacunarity = self:AddInput("Lacunarity", "Lacunarity", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 1.0,
+        INP_MaxScale = 4.0,
+        INP_Default = 2.0,
+    })
+
+    -- Persistence for FBM
+    InPersistence = self:AddInput("Persistence", "Persistence", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 0.5,
+    })
+
+    -- Offset for position
+    InOffsetX = self:AddInput("Offset X", "OffsetX", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -10.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 0.0,
+    })
+
+    InOffsetY = self:AddInput("Offset Y", "OffsetY", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -10.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 0.0,
+    })
+
+    InOffsetZ = self:AddInput("Offset Z", "OffsetZ", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -10.0,
+        INP_MaxScale = 10.0,
+        INP_Default = 0.0,
+    })
+
+    -- Seethe (animation intensity)
+    InSeethe = self:AddInput("Seethe", "Seethe", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 0.0,
+    })
+
+    -- Seethe Rate (animation speed)
+    InSeetheRate = self:AddInput("Seethe Rate", "SeetheRate", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 0.0,
+    })
+
+    -- Output range
+    InMinValue = self:AddInput("Min Value", "MinValue", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 0.0,
+    })
+
+    InMaxValue = self:AddInput("Max Value", "MaxValue", {
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 1.0,
+    })
+end
+
+-- ============================================================================
+-- Process Function
+-- ============================================================================
+function Process(req)
+    local img = InImage:GetValue(req)
+
+    if not img then
+        return nil
+    end
+
+    -- Read all parameters
+    local noiseType = InNoiseType:GetValue(req).Value
+    local outputMode = InOutputMode:GetValue(req).Value
+    local scale = InScale:GetValue(req).Value
+    local scaleX = InScaleX:GetValue(req).Value
+    local scaleY = InScaleY:GetValue(req).Value
+    local scaleZ = InScaleZ:GetValue(req).Value
+    local octaves = InOctaves:GetValue(req).Value
+    local lacunarity = InLacunarity:GetValue(req).Value
+    local persistence = InPersistence:GetValue(req).Value
+    local offsetX = InOffsetX:GetValue(req).Value
+    local offsetY = InOffsetY:GetValue(req).Value
+    local offsetZ = InOffsetZ:GetValue(req).Value
+    local seethe = InSeethe:GetValue(req).Value
+    local seetheRate = InSeetheRate:GetValue(req).Value
+    local minValue = InMinValue:GetValue(req).Value
+    local maxValue = InMaxValue:GetValue(req).Value
+
+    -- Get current time for animation
+    local currentTime = 0.0
+    if seetheRate > 0.0 then
+        currentTime = req.Time or 0.0
+    end
+
+    -- Precompute time offset (passed to kernel instead of separate seethe/rate)
+    local timeOffset = currentTime * seetheRate + seethe
+
+    -- ========================================================================
+    -- OpenCL GPU Path
+    -- ========================================================================
+    local success = false
+    local out_ocl = nil
+
+    if prog then
+        -- Create float copy of source image for OpenCL
+        local img_temp = Image({
+            IMG_Like = img,
+            IMG_Depth = IMG_Depth_Float,
+            IMG_CopyChannels = true,
+        })
+        img:Crop(img_temp, {})
+
+        -- Create output image
+        out_ocl = Image({
+            IMG_Like = img_temp,
+            IMG_Depth = IMG_Depth_Float,
+        })
+
+        -- Upload source image to OpenCL (read-only)
+        local srccl = prog:CreateImage(img_temp, "read")
+        -- Create writable OpenCL image for output
+        local dstcl = prog:CreateImage(out_ocl, "write")
+
+        if srccl and dstcl then
+            local kernel = prog:CreateKernel("Noise3DKernel")
+            if kernel and kernel >= 0 then
+                -- Set kernel arguments (must match kernel parameter order)
+                prog:SetArg(kernel, 0, srccl)                                    -- FuReadImage_t src
+                prog:SetArg(kernel, 1, dstcl)                                    -- FuWriteImage_t dst
+                prog:SetArgInt(kernel, 2, img_temp.Width, img_temp.Height)       -- int2 imgsize
+                prog:SetArgInt(kernel, 3, noiseType)                             -- int noiseType
+                prog:SetArgInt(kernel, 4, outputMode)                            -- int outputMode
+                prog:SetArg(kernel, 5, scale)                                    -- float scale
+                prog:SetArg(kernel, 6, scaleX)                                   -- float scaleX
+                prog:SetArg(kernel, 7, scaleY)                                   -- float scaleY
+                prog:SetArg(kernel, 8, scaleZ)                                   -- float scaleZ
+                prog:SetArgInt(kernel, 9, octaves)                               -- int octaves
+                prog:SetArg(kernel, 10, lacunarity)                              -- float lacunarity
+                prog:SetArg(kernel, 11, persistence)                             -- float persistence
+                prog:SetArg(kernel, 12, offsetX)                                 -- float offsetX
+                prog:SetArg(kernel, 13, offsetY)                                 -- float offsetY
+                prog:SetArg(kernel, 14, offsetZ)                                 -- float offsetZ
+                prog:SetArg(kernel, 15, timeOffset)                              -- float timeOffset
+                prog:SetArg(kernel, 16, minValue)                                -- float minValue
+                prog:SetArg(kernel, 17, maxValue)                                -- float maxValue
+
+                success = prog:RunKernel(kernel)
+            end
+
+            if success then
+                success = prog:Download(dstcl, out_ocl)
+            end
+
+            -- Release OpenCL resources
+            if srccl then srccl:Release() end
+            if dstcl then dstcl:Release() end
+        end
+    end
+
+    -- If OpenCL succeeded, output the result and return
+    if success and out_ocl then
+        OutImage:Set(req, out_ocl)
+        return
+    end
+
+    -- ========================================================================
+    -- CPU Fallback (identical to the non-OpenCL version)
+    -- ========================================================================
+
+    -- Get DataWindow and RoI
+    local dod = req:GetInputDoD(InImage)
+    local roi = req:GetRoI()
+    local datawnd = dod:Intersect(img.DataWindow)
+    if roi then
+        datawnd = roi:Intersect(datawnd)
+    end
+
+    -- Create a temporary float image and copy source data
+    local img_temp = Image({
+        IMG_Like = img,
+        IMG_DataWindow = datawnd,
+        IMG_ValidWindow = roi and roi.ValidWindow,
+        IMG_Depth = IMG_Depth_Float,
+        IMG_CopyChannels = true,
+    })
+    img:Crop(img_temp, {})
+
+    local out = Image({
+        IMG_Like = img_temp,
+        IMG_DataWindow = datawnd,
+        IMG_ValidWindow = roi and roi.ValidWindow,
+        IMG_Depth = IMG_Depth_Float,
+        IMG_NoData = true,
+    })
+
+    -- Get image dimensions from DataWindow
+    local DWleft = datawnd.left
+    local DWbottom = datawnd.bottom
+    local DWright = datawnd.right
+    local DWtop = datawnd.top
+    local width = DWright - DWleft
+    local height = DWtop - DWbottom
+
+    -- Pixel processing function (CPU fallback)
+    local function processPixel(x, y, p)
+        local posX = p.R + OffsetX
+        local posY = p.G + OffsetY
+        local posZ = p.B + OffsetZ
+
+        local noiseValue = 0.0
+
+        local function localFade(t)
+            local t2 = t * t
+            local t3 = t2 * t
+            return t3 * (t * (t * 6.0 - 15.0) + 10.0)
+        end
+
+        local function localLerp(a, b, t)
+            return a + t * (b - a)
+        end
+
+        local function localHash(n)
+            local h = math.sin(n * 12.9898) * 43758.5453
+            local result = h - math.floor(h)
+            return result * 2.0 - 1.0
+        end
+
+        local function localHash3(x, y, z)
+            return localHash(x * 12.9898 + y * 78.233 + z * 43758.5453)
+        end
+
+        local function localGrad3(hash_val, x, y, z)
+            local h_norm = (hash_val + 1.0) * 0.5
+            local angle = h_norm * 6.28318530718
+            local cos_a = math.cos(angle)
+            local sin_a = math.sin(angle)
+            return cos_a * x + sin_a * y + (cos_a * 0.707106781 + sin_a * 0.707106781) * z
+        end
+
+        local function localPerlinNoise3D(x, y, z)
+            local X = math.floor(x)
+            local Y = math.floor(y)
+            local Z = math.floor(z)
+
+            local fx = x - X
+            local fy = y - Y
+            local fz = z - Z
+
+            local X1 = X + 1.0
+            local Y1 = Y + 1.0
+            local Z1 = Z + 1.0
+
+            local u = localFade(fx)
+            local v = localFade(fy)
+            local w = localFade(fz)
+
+            local h000 = localHash3(X, Y, Z)
+            local h001 = localHash3(X, Y, Z1)
+            local h010 = localHash3(X, Y1, Z)
+            local h011 = localHash3(X, Y1, Z1)
+            local h100 = localHash3(X1, Y, Z)
+            local h101 = localHash3(X1, Y, Z1)
+            local h110 = localHash3(X1, Y1, Z)
+            local h111 = localHash3(X1, Y1, Z1)
+
+            local AAA = localGrad3(h000, fx, fy, fz)
+            local ABA = localGrad3(h001, fx, fy, fz - 1.0)
+            local AAB = localGrad3(h010, fx, fy - 1.0, fz)
+            local ABB = localGrad3(h011, fx, fy - 1.0, fz - 1.0)
+            local BAA = localGrad3(h100, fx - 1.0, fy, fz)
+            local BBA = localGrad3(h101, fx - 1.0, fy, fz - 1.0)
+            local BAB = localGrad3(h110, fx - 1.0, fy - 1.0, fz)
+            local BBB = localGrad3(h111, fx - 1.0, fy - 1.0, fz - 1.0)
+
+            return localLerp(
+                localLerp(
+                    localLerp(AAA, BAA, u),
+                    localLerp(ABA, BBA, u),
+                    w
+                ),
+                localLerp(
+                    localLerp(AAB, BAB, u),
+                    localLerp(ABB, BBB, u),
+                    w
+                ),
+                v
+            )
+        end
+
+        local function localValueNoise3D(x, y, z)
+            local X = math.floor(x)
+            local Y = math.floor(y)
+            local Z = math.floor(z)
+
+            local fx = x - X
+            local fy = y - Y
+            local fz = z - Z
+
+            local X1 = X + 1.0
+            local Y1 = Y + 1.0
+            local Z1 = Z + 1.0
+
+            local u = localFade(fx)
+            local v = localFade(fy)
+            local w = localFade(fz)
+
+            local a = localHash3(X, Y, Z)
+            local b = localHash3(X1, Y, Z)
+            local c = localHash3(X, Y1, Z)
+            local d = localHash3(X1, Y1, Z)
+            local e = localHash3(X, Y, Z1)
+            local f = localHash3(X1, Y, Z1)
+            local g = localHash3(X, Y1, Z1)
+            local h = localHash3(X1, Y1, Z1)
+
+            return localLerp(
+                localLerp(
+                    localLerp(a, b, u),
+                    localLerp(c, d, u),
+                    v
+                ),
+                localLerp(
+                    localLerp(e, f, u),
+                    localLerp(g, h, u),
+                    v
+                ),
+                w
+            )
+        end
+
+        local cpuTimeOffset = CurrentTime * SeetheRate + Seethe
+
+        local function generateNoise(channelOffsetX, channelOffsetY, channelOffsetZ)
+            local noiseVal = 0.0
+            local finalPosX = posX + channelOffsetX
+            local finalPosY = posY + channelOffsetY
+            local finalPosZ = posZ + channelOffsetZ + cpuTimeOffset
+
+            if NoiseType == 0 then
+                noiseVal = localPerlinNoise3D(finalPosX * Scale * ScaleX, finalPosY * Scale * ScaleY,
+                    finalPosZ * Scale * ScaleZ)
+            elseif NoiseType == 1 then
+                local s = 0.707106781
+                noiseVal = localPerlinNoise3D(finalPosX * Scale * ScaleX * s, finalPosY * Scale * ScaleY * s,
+                    finalPosZ * Scale * ScaleZ * s)
+            elseif NoiseType == 2 then
+                noiseVal = localValueNoise3D(finalPosX * Scale * ScaleX, finalPosY * Scale * ScaleY,
+                    finalPosZ * Scale * ScaleZ)
+            elseif NoiseType == 3 then
+                local sx = finalPosX * Scale * ScaleX
+                local sy = finalPosY * Scale * ScaleY
+                local sz = finalPosZ * Scale * ScaleZ
+                local cellX = math.floor(sx)
+                local cellY = math.floor(sy)
+                local cellZ = math.floor(sz)
+                local minDistSq = math.huge
+                for k = -1, 1 do
+                    for j = -1, 1 do
+                        for i = -1, 1 do
+                            local neighborX = cellX + i
+                            local neighborY = cellY + j
+                            local neighborZ = cellZ + k
+                            local pointX = neighborX + localHash3(neighborX, neighborY, neighborZ) * 0.5 + 0.25
+                            local pointY = neighborY + localHash3(neighborX + 1.0, neighborY, neighborZ) * 0.5 + 0.25
+                            local pointZ = neighborZ + localHash3(neighborX, neighborY + 1.0, neighborZ) * 0.5 + 0.25
+                            local dx = sx - pointX
+                            local dy = sy - pointY
+                            local dz = sz - pointZ
+                            local distSq = dx * dx + dy * dy + dz * dz
+                            if distSq < minDistSq then
+                                minDistSq = distSq
+                            end
+                        end
+                    end
+                end
+                noiseVal = math.sqrt(minDistSq) * 2.0 - 1.0
+            elseif NoiseType == 4 then
+                local value = 0.0
+                local amplitude = 1.0
+                local frequency = 1.0
+                local maxValue = 0.0
+                local posX_scaled = finalPosX * Scale * ScaleX
+                local posY_scaled = finalPosY * Scale * ScaleY
+                local posZ_scaled = finalPosZ * Scale * ScaleZ
+                for i = 0, Octaves - 1 do
+                    value = value +
+                        localPerlinNoise3D(posX_scaled * frequency, posY_scaled * frequency, posZ_scaled * frequency) *
+                        amplitude
+                    maxValue = maxValue + amplitude
+                    amplitude = amplitude * Persistence
+                    frequency = frequency * Lacunarity
+                end
+                noiseVal = value / maxValue
+            else
+                noiseVal = localPerlinNoise3D(finalPosX * Scale * ScaleX, finalPosY * Scale * ScaleY,
+                    finalPosZ * Scale * ScaleZ)
+            end
+
+            noiseVal = (noiseVal + 1.0) * 0.5
+            noiseVal = localLerp(MinValue, MaxValue, noiseVal)
+            noiseVal = noiseVal < 0.0 and 0.0 or (noiseVal > 1.0 and 1.0 or noiseVal)
+
+            return noiseVal
+        end
+
+        if OutputMode == 1 then
+            local offsetR = 100.0
+            local offsetG = 200.0
+            local offsetB = 300.0
+            p.R = generateNoise(offsetR, offsetR * 0.5, offsetR * 0.25)
+            p.G = generateNoise(offsetG, offsetG * 0.5, offsetG * 0.25)
+            p.B = generateNoise(offsetB, offsetB * 0.5, offsetB * 0.25)
+        else
+            local noiseValue = generateNoise(0.0, 0.0, 0.0)
+            p.R = noiseValue
+            p.G = noiseValue
+            p.B = noiseValue
+        end
+
+        return p
+    end
+
+    -- Prepare userData for CPU fallback
+    local userData = {
+        OffsetX = offsetX,
+        OffsetY = offsetY,
+        OffsetZ = offsetZ,
+        NoiseType = noiseType,
+        OutputMode = outputMode,
+        Scale = scale,
+        ScaleX = scaleX,
+        ScaleY = scaleY,
+        ScaleZ = scaleZ,
+        Seethe = seethe,
+        SeetheRate = seetheRate,
+        CurrentTime = currentTime,
+        Octaves = octaves,
+        Lacunarity = lacunarity,
+        Persistence = persistence,
+        MinValue = minValue,
+        MaxValue = maxValue,
+    }
+
+    out:MultiProcessPixels(nil, userData, DWleft, DWbottom, width, height, img_temp, processPixel)
+
+    OutImage:Set(req, out)
+end
