@@ -1,127 +1,137 @@
-"""""" """""" """""" """""" """""" """""" """""" """""" """""" """""" """'
-ReloadLoaders
--------------
-Version: v1.03
-Last update: 24 Sep 2019
+﻿# version_switch_mijo
+# ------------------------------------------------------------------------
+# Retarget the selected (or all) Loader clip paths that contain a  vNNN
+# version folder to a different EXISTING version on disk, then reload the
+# footage and fix the frame range.
+#
+# Self-contained by design: drop this file anywhere in Fusion's Scripts menu
+# tree and it just runs (no shared module, no fixed path assumptions).
+#
+# There are THREE of these scripts (Down / Up / Latest). They are IDENTICAL
+# except for the single  MODE = "..."  line below. If you change the logic,
+# copy everything below the MODE line to the other two files verbatim.
+#
+#     MODE = "down"    -> previous existing version
+#     MODE = "up"      -> next existing version
+#     MODE = "latest"  -> newest existing version
+#
+# Reload / duration-fix trick adapted from AlbertoGZ's ReloadLoaders.
+# Runs inside Fusion's Python console; uses the injected globals comp / fusion.
+# ------------------------------------------------------------------------
 
-Description:The ReloadLoaders script will refresh all or selected Loader nodes in your comp
-            by rereading the "clip" filename attribute so it also updates the footage
-            for the full duration of the sequence.
+MODE = "up"
 
-Installation: copy AlbertoGZ/ReloadLoaders folder in your Fusion:/Scripts/Comp/
-
-Author: AlbertoGZ
-Email: albertogzgz@gmail.com
-Website: albertogz.com
-
-""" """""" """""" """""" """""" """""" """""" """""" """""" """""" """"""
-
-import os 
+# ===== shared body (keep identical across Down / Up / Latest) ============
+import os
 import re
 
-comp.StartUndo('version_up')
+# Matches a  <sep>v<digits><sep>  path segment: any separator, any padding,
+# case-insensitive.  e.g.  \v001\   /v0001/   \v12\   \V5\
+VERSION_RE = re.compile(r'([\\/])v(\d+)([\\/])', re.IGNORECASE)
+# A bare version-folder NAME on disk, e.g.  v001 / v0001 / V5
+FOLDER_RE = re.compile(r'v(\d+)$', re.IGNORECASE)
 
-allLoaders = comp.GetToolList(False, "Loader").values()
-selLoaders = comp.GetToolList(True, "Loader").values()
 
-# Check if selection and builds list with Loaders in,
-# otherwise list inlcude all Loaders
-if selLoaders:
-    toollist = selLoaders
-else:
-    toollist = allLoaders
-
-# add comp lock to remove prompt window
-comp.Lock()
-# Evaluate Loaders in list
-
-# mijo fix bug
-currentTime = comp.CurrentTime
-comp.CurrentTime = comp.GetAttrs('COMPN_GlobalStart')
-
-for tool in toollist:
-    loaderPath = tool.GetAttrs("TOOLST_Clip_Name")
-    loaderName = tool.GetAttrs("TOOLS_Name")
-    loaderPathClean = loaderPath[1]
-    durationOld = tool.GetAttrs("TOOLIT_Clip_Length")
-    durationOldClean = durationOld[1]
-    
-    # mijo add version switch
-    post_version_path = loaderPathClean
-    # something like \v001\
-    p = re.compile('\\\\v\d\d\d\\\\') 
-    p_search_1 = p.search(post_version_path)
-    
-    #print(p_search_1[0])
-    p_search_1_version_num = int(p_search_1[0][2:-1])
-    
-    p_search_1_version_num = min(max(p_search_1_version_num,0),999)
-    
-    #print(p_search_1_version_num)
-    for i in range(p_search_1_version_num,999,1):
-        p_search_1_version_num = p_search_1_version_num + 1 
-        p_search_1_version_num_Str = '{:03d}'.format(p_search_1_version_num)
-        #print(p_search_1_version_num_Str)
-        
-        p_search_1_version_num_Str = 'v'+p_search_1_version_num_Str
-        
-        #print(p_search_1_version_num_Str)
-        
-        to_replace = '\\\\'+p_search_1_version_num_Str+'\\\\'
-        
-        #post_version_path = re.sub(r'\\\\v\d\d\d\\\\',to_replace,post_version_path)
-        post_version_path = re.sub('\\\\v\d\d\d\\\\',to_replace,post_version_path)
-        
-        remap_path = comp.MapPath(post_version_path)
-        
-
-        isExist = os.path.exists(remap_path)
-        #print(isExist)
-        if isExist :
-            print(str(p_search_1[0])+'____'+to_replace)
-            print(post_version_path)
-            break
-    
-    loaderPathClean = post_version_path
-    
-    # Rename the clipname to force reload duration
-    tool.Clip = loaderPathClean + ""
-    tool.Clip = loaderPathClean
-    durationNew = tool.GetAttrs("TOOLIT_Clip_Length")
-    durationNewClean = durationNew[1]
-
-    # Disable/enable to reload clip cache
-    tool.SetAttrs({"TOOLB_PassThrough": True})
-    tool.SetAttrs({"TOOLB_PassThrough": False})
-
-    # Outputs
-    print(loaderName + " has been reloaded.")
-    #print(" + current filename: " + tool.Clip[0])
-    #print(" + old duration: " + str(durationOldClean) + " frames")
-    #print(" + new duration: " + str(durationNewClean) + " frames")
-    #print("")
-    
-    ## mijo frame num abs
-    filePath = loaderPath[1].split('.')
+def _list_versions(path, match):
+    """Return {version_int: real_folder_name} for every vNNN sibling folder
+    that actually exists next to the current version folder on disk."""
+    # Parent dir = everything up to and including the separator before vNNN.
+    parent = path[:match.start() + 1]
+    parent_mapped = comp.MapPath(parent)
+    versions = {}
     try:
-        filePathFrameStr = filePath[-2]
-        filePathFrame = int(filePathFrameStr)
-    except ValueError :
-        filePathFrame = 0
-    
-    
-    
-    tool.GlobalOut[fusion.TIME_UNDEFINED] = filePathFrame+durationNewClean-1
-    tool.GlobalIn[fusion.TIME_UNDEFINED] = filePathFrame
-    
-    tool.ClipTimeStart[fusion.TIME_UNDEFINED] = 0
-    tool.ClipTimeEnd[fusion.TIME_UNDEFINED] = durationNewClean
-    
-    tool.GlobalOut[fusion.TIME_UNDEFINED] = filePathFrame+durationNewClean-1
-
-comp.CurrentTime = currentTime
-
-comp.Unlock()
+        entries = os.listdir(parent_mapped)
+    except OSError:
+        return versions
+    for name in entries:
+        m = FOLDER_RE.match(name)
+        if m and os.path.isdir(os.path.join(parent_mapped, name)):
+            versions[int(m.group(1))] = name
+    return versions
 
 
-comp.EndUndo(True)
+def _pick_version(versions, current, mode):
+    """Choose the target version number from the existing ones, or None."""
+    if not versions:
+        return None
+    keys = sorted(versions)
+    if mode == "up":
+        higher = [v for v in keys if v > current]
+        return higher[0] if higher else None
+    if mode == "down":
+        lower = [v for v in keys if v < current]
+        return lower[-1] if lower else None
+    # latest
+    return keys[-1]
+
+
+def _retarget_path(path, match, target_folder):
+    """Swap the matched vNNN segment for target_folder, keeping the original
+    separators and the rest of the path untouched (Fusion path format)."""
+    sep_before, sep_after = match.group(1), match.group(3)
+    return (path[:match.start()] + sep_before + target_folder
+            + sep_after + path[match.end():])
+
+
+def switch_versions(mode):
+    comp.StartUndo('version_switch_' + mode)
+
+    selLoaders = comp.GetToolList(True, "Loader").values()
+    allLoaders = comp.GetToolList(False, "Loader").values()
+    toollist = selLoaders if selLoaders else allLoaders
+
+    comp.Lock()
+
+    # Clip length is only reliable at the comp's global start frame.
+    currentTime = comp.CurrentTime
+    comp.CurrentTime = comp.GetAttrs('COMPN_GlobalStart')
+
+    try:
+        for tool in toollist:
+            loaderName = tool.GetAttrs("TOOLS_Name")
+            loaderPath = tool.GetAttrs("TOOLST_Clip_Name")[1]
+
+            match = VERSION_RE.search(loaderPath)
+            if not match:
+                print(loaderName + ": no  vNNN  version folder in path, skipped.")
+                continue
+
+            current = int(match.group(2))
+            versions = _list_versions(loaderPath, match)
+            target = _pick_version(versions, current, mode)
+
+            if target is None:
+                print(loaderName + ": no " + mode + " version found "
+                      "(current v" + match.group(2) + "), skipped.")
+                continue
+
+            new_path = _retarget_path(loaderPath, match, versions[target])
+
+            # Force a reload by re-setting the clip name.
+            tool.Clip = new_path + ""
+            tool.Clip = new_path
+            durationNew = tool.GetAttrs("TOOLIT_Clip_Length")[1]
+
+            # Disable/enable to flush the clip cache.
+            tool.SetAttrs({"TOOLB_PassThrough": True})
+            tool.SetAttrs({"TOOLB_PassThrough": False})
+
+            # Re-derive the sequence start frame from the filename ( ...NNNN.exr ).
+            try:
+                filePathFrame = int(loaderPath.split('.')[-2])
+            except (ValueError, IndexError):
+                filePathFrame = 0
+
+            tool.GlobalIn[fusion.TIME_UNDEFINED] = filePathFrame
+            tool.GlobalOut[fusion.TIME_UNDEFINED] = filePathFrame + durationNew - 1
+            tool.ClipTimeStart[fusion.TIME_UNDEFINED] = 0
+            tool.ClipTimeEnd[fusion.TIME_UNDEFINED] = durationNew
+
+            print(loaderName + ": v" + match.group(2) + " -> " + versions[target])
+    finally:
+        comp.CurrentTime = currentTime
+        comp.Unlock()
+        comp.EndUndo(True)
+
+
+switch_versions(MODE)
