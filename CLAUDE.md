@@ -48,6 +48,12 @@ Fusion console scripts assume globals are already present. Common idioms seen th
 
 `B_mj_version_Down.py`, `C_mj_version_up.py`, `D_mj_version_latest.py` are **near-identical** — they retarget Loader clip paths containing a `\vNNN\` version folder to a different existing version on disk. The **only** meaningful difference between the three is the scan-loop direction (down / up / newest-existing). A behaviour change to the path logic must be applied to all three.
 
+### deadline_quick_submit_mijo (`Script/Comp/mijo_WIP/deadline_quick_submit_mijo/`)
+
+`A_mj_deadline_quick_submit.py` is a no-dialog replacement for Deadline's stock Fusion submitter (`<repo>/submission/Fusion/Main/SubmitToDeadline.eyeonscript`). It auto-saves the comp, runs QC, writes job/plugin info files to the temp dir, and shells out to `deadlinecommand` **on a daemon thread** so Fusion's UI never blocks.
+
+The job/plugin info keys and the `?`-padding of saver output paths mirror the stock submitter — **if you change either, diff against that eyeonscript first**, since the `Fusion` Deadline plugin parses these keys (`plugins/Fusion/Fusion.options` lists the plugin-info side). QC splits into *errors* (no enabled Saver, saver output on a local C/D/E drive, relative saver path) which abort, and *warnings* (loader issues) which only print. Settings live in the `DEFAULTS` dict and are overridable per-user via `fusion:SetData("MIJO_DEADLINE_<key>", ...)` without editing the file.
+
 ### Other scripts
 - `Script/fusion_daily_tools/daily_h264_saver.py` — creates/updates a Saver node named `Solvfx_daily_h264_saver` pointing at a dated daily-review folder (`.../<project>/<YYMMDD>/<user>/`), auto-detecting project/user from the path, env vars, or comp file.
 - `Script/FrameRenderScript/force_re_render_v00010001.lua` — one-liner that sets `self.FrameRenderScript` to bust a stale render cache.
