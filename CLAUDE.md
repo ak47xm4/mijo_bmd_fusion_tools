@@ -23,7 +23,19 @@ py -m py_compile Script/Comp/mijo_WIP/*/*.py Script/fusion_daily_tools/*.py Scri
 # `copy_test_mijo.cmd` (see "Local reference material" below).
 ```
 
-No Lua interpreter is installed, so `.fuse` files can only be validated by loading them in Fusion.
+There is no standalone `lua` on PATH, but **Fusion ships one** — `fuscript.exe` (next to `lua5.1.dll` in each install) runs plain Lua 5.1 scripts with no Fusion instance required:
+
+```bash
+# Syntax-check a fuse without loading it into Fusion. loadfile compiles but does not
+# run, so the missing FuRegisterClass/self/Image globals don't matter.
+cd "$CLAUDE_JOB_DIR/tmp"
+printf 'local f,e=loadfile([[C:\\...\\fuse\\noise_3D_mijo.fuse]])\nprint(f and "OK" or e)\n' > c.lua
+"/c/Program Files/Blackmagic Design/Fusion 20/fuscript.exe" -l lua c.lua
+```
+
+This is also enough to **benchmark and eyeball the noise itself** outside Fusion: pull the algorithm block out of `processPixel` into a file, `dofile` it, set the userData values, and call it in a loop. Two gotchas — fuscript runs the main script in a sandbox whose *writes* do not reach `_G` while `dofile`'d chunks *read* `_G`, so set shared globals as `_G.Name = …`; and rendering a PGM from Lua plus a ~10-line `zlib`+`struct` PNG encoder in Python gives you an image you can actually look at. Fusion 18/20/21 and DaVinci Resolve are all installed here.
+
+Loading into Fusion is still the only way to validate the *fuse API* surface (`Image{}`, `MultiProcessPixels`, DoD/RoI, OpenCL) — fuscript only covers the pure-Lua half.
 
 **Deploy / test loop:** copy the artifact into a live Fusion install and reload. `copy_test_mijo.cmd` (Windows, **gitignored**, machine-specific Afanasy render-farm paths) does this:
 
@@ -54,11 +66,12 @@ A `.fuse` is a Lua module Fusion loads to register a tool. Lifecycle callbacks (
 
 `out:MultiProcessPixels(nil, userData, left, bottom, w, h, srcImage, processPixel)` runs `processPixel(x, y, p)` in Fusion's **worker context**, where module-scope functions and `Process` locals are *not* visible — only the keys of the `userData` table, injected as globals. Consequences:
 
-- Every helper the pixel function needs is **re-inlined inside it** (`localHash3`, `lPerlin`, …). The module-scope copies in `noise_3D_mijo.fuse` (`hash`, `perlinNoise3D`, `getNoiseValue`, …) are effectively **dead code** kept for reference — `Process` never calls them.
-- Inside `processPixel`, controls are referenced by their **userData key** (`Scale`, `NoiseType`, `CurrentTime`), not by the `Process` local (`scale`, `noiseType`, `currentTime`).
-- **Adding a control means four edits:** `AddInput` in `Create()`, a `GetValue` in `Process()`, an entry in the `userData` table, and its use inside `processPixel`. Miss the userData entry and the value silently reads as `nil` in the pixel loop.
+- Every helper the pixel function needs must be **defined inside it**. `noise_3D_mijo_openCL.fuse` does this the plain way — re-declaring `lHash3`, `lPerlin`, … on *every* pixel. `noise_3D_mijo.fuse` instead builds them **once per worker state**, behind an `if not N3D_gen then … end` guard that publishes a single `N3D_gen` closure to the worker globals; later pixels just call it. If Fusion ever hands the pixel function a fresh environment table, `N3D_gen` reads back as `nil` and the block simply rebuilds — same output, only the old cost. Verified: wiping `N3D_gen` mid-run reproduces bit-identical results.
+- **A long-lived closure must never read a userData global.** `N3D_gen` outlives a single `Process` call, so anything that can change between calls (scales, octaves, min/max) is passed as an **argument**; reading it as a global risks binding to a stale environment. Only `processPixel` itself — which Fusion re-supplies each run — reads the userData globals.
+- Inside `processPixel`, controls are referenced by their **userData key** (`CScaleX`, `NoiseType`, `TimeOffset`), not by the `Process` local (`combinedScaleX`, `noiseType`, `timeOffset`).
+- **Adding a control means four edits:** `AddInput` in `Create()`, a `GetValue` in `Process()`, an entry in the `userData` table, and its use inside `processPixel` (plus threading it through `N3D_gen`'s parameter list in the CPU fuse). Miss the userData entry and the value silently reads as `nil` in the pixel loop.
 
-Both fuses build a float `img_temp` copy of the input (`IMG_Depth_Float`, `IMG_CopyChannels`) before processing, and force float output — the input's R/G/B are read as XYZ *positions*, so 8/16-bit input would clip them.
+Both fuses force float output and need a float *source* — the input's R/G/B are read as XYZ *positions*, so 8/16-bit input would clip them. The CL fuse always builds an `img_temp` copy (`IMG_Depth_Float`, `IMG_CopyChannels`); the CPU fuse skips that ~33 MB copy when the input is already float **and** its DataWindow exactly matches the region to process, otherwise it falls back to the same copy.
 
 ### The Noise 3D tools (two files, three code paths)
 
@@ -73,11 +86,15 @@ Shared controls: Noise Type, Output Mode, Scale + Scale X/Y/Z, Octaves / Lacunar
 
 There are three distinct pixel paths, and **they do not produce identical noise** — this is the most important thing to know before "fixing" a mismatch:
 
-1. `noise_3D_mijo.fuse` CPU — `sin`-based fract hash + **trig** gradient (`cos/sin` of an angle).
+1. `noise_3D_mijo.fuse` CPU — **integer** hash (three rounds of quadratic mixing, no `sin`, no `math.floor`) + standard Perlin **12-vector gradient table**. Simplex is a real 3D simplex (4 corners), not a rescaled Perlin.
 2. `noise_3D_mijo_openCL.fuse` CPU fallback — `sin`-based fract hash + **trig-free** Perlin bit-selection gradient.
 3. `noise_3D_mijo_openCL.fuse` GPU kernel — **integer** hash (`ihash`, pure ALU) + the same bit-selection gradient.
 
-Paths 2 and 3 share structure and gradient but use different hashes, so flipping `Process Mode` between GPU and CPU **changes the pattern**, not just the speed. Treat "GPU and CPU look different" as known behaviour; only report it as a bug if the *structure* (scale, octaves, range remap) diverges.
+All three differ. Paths 2 and 3 share structure and gradient but use different hashes, so flipping `Process Mode` between GPU and CPU **changes the pattern**, not just the speed. Path 1 was rewritten for speed and quality and matches neither — it is the best-looking of the three (measured: neighbouring-lattice correlation < 0.01, flatter gradient-bucket chi-square, no directional streaking) and the fastest per-pixel. Treat "the three look different" as known behaviour; only report it as a bug if the *structure* (scale, octaves, range remap) diverges. **If you want them unified, port path 1's `mixi` + gradient table into the CL fuse** rather than reverting path 1.
+
+Only the CPU fuse declares `REG_SupportsDoD = true` (with a matching `PrecalcProcess`). Without that flag Fusion expands the input to full frame before `Process` runs, which left its `GetInputDoD` / `GetRoI` intersection largely moot; the CL fuse still does not declare it.
+
+Two things in path 1 are calibrated constants, not free parameters: Perlin is scaled by `1.1547` (= 2/√3, normalising the theoretical range to ±1), and Simplex by `freq × 0.4834, amp × 0.8228` — measured from its autocorrelation distance and stddev against Perlin so switching Noise Type does not jump the pattern's size or contrast. Re-measure before changing either.
 
 ### OpenCL variant specifics
 

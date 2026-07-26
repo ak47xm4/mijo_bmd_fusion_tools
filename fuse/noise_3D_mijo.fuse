@@ -1,5 +1,21 @@
 -- Noise 3D mijo
 -- run in CPU
+--
+-- 效能重點 / Performance notes：
+--   1. processPixel 內的 helper 只在每個 worker state 建立「一次」（惰性初始化到
+--      worker 全域）。若 Fusion 換掉環境表，N3D_gen 會是 nil → 重新建立，結果仍正確，
+--      只是退回舊有成本。任何跨 Process 呼叫可能改變的值一律用「參數」傳入，
+--      絕不讓長存的 closure 去讀全域，避免讀到過期的 userData。
+--   2. hash 改為純整數三輪二次混合（無 sin / 無 floor）。中間值全部 < 2^53，
+--      座標先摺疊到 2^20 以保證不溢位。
+--   3. gradient 改為標準 Perlin 12 向量查表（無 cos/sin）。
+--   4. 格點梯度快取：相鄰 pixel 落在同一格時，8 次 hash + 24 次查表直接跳過。
+--   5. math.floor(x) → x - x % 1，frac(x) → x % 1（OP_MOD 是 VM 內聯指令，
+--      省掉 math 表查找 + C 呼叫協定）。
+--   6. Simplex 改為真正的 3D Simplex（4 個角，非 Perlin 縮放）。
+--
+-- 與 noise_3D_mijo_openCL.fuse 的關係：本檔的 hash / gradient 已與 CL 版的兩條
+-- 路徑都不同，圖案不會相符。要對齊的話得把這裡的演算法移植過去。
 
 FuRegisterClass("Noise3D_mijo", CT_Tool, {
     REGS_Name = "Noise 3D mijo",
@@ -10,6 +26,7 @@ FuRegisterClass("Noise3D_mijo", CT_Tool, {
     REG_OpNoBlendCtrls = true,
     REG_NoObjMatCtrls = true,
     REG_NoMotionBlurCtrls = true,
+    REG_SupportsDoD = true,
 })
 
 function Create()
@@ -157,239 +174,25 @@ function Create()
     })
 end
 
--- Optimized hash function - faster alternative using fractional part
--- Reduced sin/cos calls for better performance
-function hash(n)
-    -- Fast hash using fractional part of multiplication
-    -- Single sin call instead of multiple sin/cos
-    local n_scaled = n * 12.9898
-    local h = math.sin(n_scaled) * 43758.5453
-    -- Extract fractional part and normalize to [-1, 1]
-    local result = h - math.floor(h)
-    return result * 2.0 - 1.0
-end
-
-function hash3(x, y, z)
-    -- Use float coordinates directly with different multipliers
-    local n = x * 12.9898 + y * 78.233 + z * 43758.5453
-    return hash(n)
-end
-
--- Dot product for gradient
-function dot(gx, gy, gz, x, y, z)
-    return gx * x + gy * y + gz * z
-end
-
--- Fade function for smooth interpolation
-function fade(t)
-    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
-end
-
-function lerp(a, b, t)
-    return a + t * (b - a)
-end
-
--- Optimized gradient function - reduced trigonometric calls
-function grad3(hash_val, x, y, z)
-    -- Simplified gradient using single angle calculation
-    -- Normalize hash to [0, 1] range
-    local h_norm = (hash_val + 1.0) * 0.5
-    -- Single angle calculation instead of two
-    local angle = h_norm * 6.28318530718 -- 2*PI
-    local cos_a = math.cos(angle)
-    local sin_a = math.sin(angle)
-    -- Combine x, y, z with rotated coordinates
-    return cos_a * x + sin_a * y + (cos_a * 0.707106781 + sin_a * 0.707106781) * z
-end
-
--- Perlin Noise 3D
-function perlinNoise3D(x, y, z)
-    -- Use float coordinates directly without integer grid
-    -- Get integer parts for corner positions
-    local X = math.floor(x)
-    local Y = math.floor(y)
-    local Z = math.floor(z)
-
-    -- Get fractional parts for interpolation
-    local fx = x - X
-    local fy = y - Y
-    local fz = z - Z
-
-    -- Calculate neighbor coordinates (continuous float space)
-    local X1 = X + 1.0
-    local Y1 = Y + 1.0
-    local Z1 = Z + 1.0
-
-    local u = fade(fx)
-    local v = fade(fy)
-    local w = fade(fz)
-
-    -- Use float coordinates for hash (no modulo wrapping)
-    local h000 = hash3(X, Y, Z)
-    local h001 = hash3(X, Y, Z1)
-    local h010 = hash3(X, Y1, Z)
-    local h011 = hash3(X, Y1, Z1)
-    local h100 = hash3(X1, Y, Z)
-    local h101 = hash3(X1, Y, Z1)
-    local h110 = hash3(X1, Y1, Z)
-    local h111 = hash3(X1, Y1, Z1)
-
-    local AAA = grad3(h000, fx, fy, fz)
-    local ABA = grad3(h001, fx, fy, fz - 1.0)
-    local AAB = grad3(h010, fx, fy - 1.0, fz)
-    local ABB = grad3(h011, fx, fy - 1.0, fz - 1.0)
-    local BAA = grad3(h100, fx - 1.0, fy, fz)
-    local BBA = grad3(h101, fx - 1.0, fy, fz - 1.0)
-    local BAB = grad3(h110, fx - 1.0, fy - 1.0, fz)
-    local BBB = grad3(h111, fx - 1.0, fy - 1.0, fz - 1.0)
-
-    return lerp(
-        lerp(
-            lerp(AAA, BAA, u),
-            lerp(ABA, BBA, u),
-            w
-        ),
-        lerp(
-            lerp(AAB, BAB, u),
-            lerp(ABB, BBB, u),
-            w
-        ),
-        v
-    )
-end
-
--- Simplified Simplex Noise (using Perlin-like implementation)
-function simplexNoise3D(x, y, z)
-    -- Simplified version - can be expanded with proper Simplex implementation
-    return perlinNoise3D(x * 0.707106781, y * 0.707106781, z * 0.707106781)
-end
-
--- Value Noise 3D
-function valueNoise3D(x, y, z)
-    -- Use float coordinates directly without integer grid
-    -- Get integer parts for corner positions
-    local X = math.floor(x)
-    local Y = math.floor(y)
-    local Z = math.floor(z)
-
-    -- Get fractional parts for interpolation
-    local fx = x - X
-    local fy = y - Y
-    local fz = z - Z
-
-    -- Calculate neighbor coordinates (continuous float space)
-    local X1 = X + 1.0
-    local Y1 = Y + 1.0
-    local Z1 = Z + 1.0
-
-    local u = fade(fx)
-    local v = fade(fy)
-    local w = fade(fz)
-
-    -- Use float coordinates for hash (no modulo wrapping)
-    local a = hash3(X, Y, Z)
-    local b = hash3(X1, Y, Z)
-    local c = hash3(X, Y1, Z)
-    local d = hash3(X1, Y1, Z)
-    local e = hash3(X, Y, Z1)
-    local f = hash3(X1, Y, Z1)
-    local g = hash3(X, Y1, Z1)
-    local h = hash3(X1, Y1, Z1)
-
-    return lerp(
-        lerp(
-            lerp(a, b, u),
-            lerp(c, d, u),
-            v
-        ),
-        lerp(
-            lerp(e, f, u),
-            lerp(g, h, u),
-            v
-        ),
-        w
-    )
-end
-
--- Optimized Worley Noise - uses distance squared to avoid sqrt
-function worleyNoise3D(x, y, z)
-    -- Use float cell coordinates
-    local cellX = math.floor(x)
-    local cellY = math.floor(y)
-    local cellZ = math.floor(z)
-
-    local minDistSq = math.huge
-
-    for k = -1, 1 do
-        for j = -1, 1 do
-            for i = -1, 1 do
-                -- Use float coordinates directly
-                local neighborX = cellX + i
-                local neighborY = cellY + j
-                local neighborZ = cellZ + k
-
-                -- Generate feature point using float hash
-                local pointX = neighborX + hash3(neighborX, neighborY, neighborZ) * 0.5 + 0.25
-                local pointY = neighborY + hash3(neighborX + 1.0, neighborY, neighborZ) * 0.5 + 0.25
-                local pointZ = neighborZ + hash3(neighborX, neighborY + 1.0, neighborZ) * 0.5 + 0.25
-
-                local dx = x - pointX
-                local dy = y - pointY
-                local dz = z - pointZ
-                local distSq = dx * dx + dy * dy + dz * dz
-
-                if distSq < minDistSq then
-                    minDistSq = distSq
-                end
-            end
-        end
+-- 宣告 REG_SupportsDoD 後，讓 Fusion 在 precalc 階段就知道輸出的 DataWindow，
+-- 上游 DoD 很小時就不會被展開成全幀。
+function PrecalcProcess(req)
+    local img = InImage:GetValue(req)
+    if not img then
+        return
     end
 
-    -- Only calculate sqrt once at the end
-    return math.sqrt(minDistSq)
-end
+    local dod = req:GetInputDoD(InImage)
+    local datawnd = dod:Intersect(img.DataWindow)
 
--- FBM (Fractal Brownian Motion)
-function fbmNoise3D(x, y, z, octaves, lacunarity, persistence, noiseFunc)
-    local value = 0.0
-    local amplitude = 1.0
-    local frequency = 1.0
-    local maxValue = 0.0
+    local out = Image({
+        IMG_Like = img,
+        IMG_NoData = true,
+        IMG_DataWindow = datawnd,
+        IMG_Depth = IMG_Depth_Float,
+    })
 
-    for i = 0, octaves - 1 do
-        value = value + noiseFunc(x * frequency, y * frequency, z * frequency) * amplitude
-        maxValue = maxValue + amplitude
-        amplitude = amplitude * persistence
-        frequency = frequency * lacunarity
-    end
-
-    return value / maxValue
-end
-
--- Main noise function dispatcher
-function getNoiseValue(x, y, z, noiseType, scale, octaves, lacunarity, persistence)
-    x = x * scale
-    y = y * scale
-    z = z * scale
-
-    if noiseType == 0 then
-        -- Perlin Noise
-        return perlinNoise3D(x, y, z)
-    elseif noiseType == 1 then
-        -- Simplex Noise
-        return simplexNoise3D(x, y, z)
-    elseif noiseType == 2 then
-        -- Value Noise
-        return valueNoise3D(x, y, z)
-    elseif noiseType == 3 then
-        -- Worley Noise
-        return worleyNoise3D(x, y, z)
-    elseif noiseType == 4 then
-        -- FBM
-        return fbmNoise3D(x, y, z, octaves, lacunarity, persistence, perlinNoise3D)
-    else
-        return perlinNoise3D(x, y, z)
-    end
+    OutImage:Set(req, out)
 end
 
 function Process(req)
@@ -399,9 +202,6 @@ function Process(req)
         return nil
     end
 
-    -- Check input image depth - this is the *original* upstream image
-    -- IMG_Depth_Float = 0, IMG_Depth_8 = 1, IMG_Depth_16 = 2
-    local inputDepth = img.Depth
     local noiseType = InNoiseType:GetValue(req).Value
     local outputMode = InOutputMode:GetValue(req).Value
     local scale = InScale:GetValue(req).Value
@@ -426,6 +226,12 @@ function Process(req)
         currentTime = req.Time or 0.0
     end
 
+    -- 先算好每 pixel 都會用到的常數，避免在 pixel loop 裡重算
+    local combinedScaleX = scale * scaleX
+    local combinedScaleY = scale * scaleY
+    local combinedScaleZ = scale * scaleZ
+    local timeOffset = currentTime * seetheRate + seethe
+
     -- Get DataWindow and RoI
     local dod = req:GetInputDoD(InImage)
     local roi = req:GetRoI()
@@ -434,285 +240,395 @@ function Process(req)
         datawnd = roi:Intersect(datawnd)
     end
 
-    -- Create a temporary image to copy source data, always as 32‑bit float.
-    -- All further processing (noise) is done on this float image.
-    local img_temp = Image({
-        IMG_Like = img,
-        IMG_DataWindow = datawnd,
-        IMG_ValidWindow = roi and roi.ValidWindow,
-        IMG_Depth = IMG_Depth_Float,
-        IMG_CopyChannels = true, -- Copy channels from source to ensure correct values
-    })
-    -- Copy source image data to temporary image (Fusion will convert to float if needed)
-    img:Crop(img_temp, {})
+    -- 輸入的 R/G/B 是被當成 XYZ「位置」讀的，8/16-bit 會把座標裁掉，所以一律需要
+    -- float 來源。但輸入本來就是 float、而且 DataWindow 剛好就是要處理的範圍時，
+    -- 那份 ~33MB 的複製純屬浪費 —— 直接拿原圖當來源。
+    -- DataWindow 必須完全相同才複用，避免依賴 MultiProcessPixels 的座標語意。
+    local idw = img.DataWindow
+    local src
+    if img.Depth == IMG_Depth_Float
+        and idw.left == datawnd.left and idw.bottom == datawnd.bottom
+        and idw.right == datawnd.right and idw.top == datawnd.top then
+        src = img
+    else
+        src = Image({
+            IMG_Like = img,
+            IMG_DataWindow = datawnd,
+            IMG_ValidWindow = roi and roi.ValidWindow,
+            IMG_Depth = IMG_Depth_Float,
+            IMG_CopyChannels = true,
+        })
+        img:Crop(src, {})
+    end
 
     local out = Image({
-        IMG_Like = img_temp,
+        IMG_Like = src,
         IMG_DataWindow = datawnd,
         IMG_ValidWindow = roi and roi.ValidWindow,
-        IMG_Depth = IMG_Depth_Float, -- force 32‑bit float output
+        IMG_Depth = IMG_Depth_Float, -- force 32-bit float output
         IMG_NoData = true,           -- Don't copy channels, we'll write our own values
     })
 
     -- Get image dimensions from DataWindow
     local DWleft = datawnd.left
     local DWbottom = datawnd.bottom
-    local DWright = datawnd.right
-    local DWtop = datawnd.top
-    local width = DWright - DWleft
-    local height = DWtop - DWbottom
+    local width = datawnd.right - DWleft
+    local height = datawnd.top - DWbottom
 
-    -- Process pixels using MultiProcessPixels
-    -- Define function BEFORE creating userData, similar to Grade.fuse
-    -- Optimized pixel processing function
+    if width <= 0 or height <= 0 then
+        OutImage:Set(req, out)
+        return
+    end
+
+    -- ------------------------------------------------------------------------
+    -- Pixel function
+    --
+    -- MultiProcessPixels 在 worker context 執行：模組層的函式與 Process 的 local
+    -- 都看不到，只有 userData 的 key 會被注入成全域。所以 helper 必須在這裡建立，
+    -- 但沒必要「每個 pixel」都建一次 —— 建到 worker 全域，之後的 pixel 直接重用。
+    -- ------------------------------------------------------------------------
     local function processPixel(x, y, p)
-        -- Extract RGB as XYZ position from input pixel
-        local posX = p.R + OffsetX
-        local posY = p.G + OffsetY
-        local posZ = p.B + OffsetZ
+        local gen = N3D_gen
 
-        -- Generate noise value based on NoiseType
-        -- Optimized inline functions for better performance
-        local noiseValue = 0.0
+        if not gen then
+            -- ================= 每個 worker state 只會跑到這裡一次 =================
+            local sqrt = math.sqrt
 
-        -- Inline helper functions (optimized)
-        local function localFade(t)
-            local t2 = t * t
-            local t3 = t2 * t
-            return t3 * (t * (t * 6.0 - 15.0) + 10.0)
-        end
+            local HM = 16777216           -- 2^24，hash 的模數
+            local HFOLD = 1048576         -- 2^20，座標摺疊範圍（保證乘法不超過 2^53）
+            local HIV = 1.0 / 16777216    -- → [0, 1)
+            local HV2 = 2.0 / 16777216    -- → [-1, 1)
+            local HG = 16.0 / 16777216    -- → [0, 16)
 
-        local function localLerp(a, b, t)
-            return a + t * (b - a)
-        end
+            -- 標準 Perlin 12 個梯度向量（立方體稜中點），末 4 個重複以湊滿 16。
+            -- 比原本「單位圓 cos/sin + z 用 0.707 加權」的做法各向同性得多，
+            -- 而且完全不需要三角函數。
+            local GX = { 1, -1, 1, -1, 1, -1, 1, -1, 0, 0, 0, 0, 1, 0, -1, 0 }
+            local GY = { 1, 1, -1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 1, -1 }
+            local GZ = { 0, 0, 0, 0, 1, 1, -1, -1, 1, 1, -1, -1, 0, 1, 0, -1 }
 
-        -- Optimized hash - single sin call
-        local function localHash(n)
-            local h = math.sin(n * 12.9898) * 43758.5453
-            local result = h - math.floor(h)
-            return result * 2.0 - 1.0
-        end
+            -- 整數格點 hash：三輪二次混合。
+            -- 純 LCG 是仿射的（沿座標軸會退化成等差數列 → 可見週期），加上 n*n
+            -- 才有非線性。中間值最大 ~2.8e14，遠在 double 的 53-bit 尾數內。
+            local function mixi(ix, iy, iz)
+                local n = ((ix % HFOLD) * 1619 + (iy % HFOLD) * 31337 + (iz % HFOLD) * 6971) % HM
+                n = (n * (n + 28411) + 12345) % HM
+                n = (n * (n + 8121) + 6971) % HM
+                n = (n * (n + 31337) + 1619) % HM
+                return n
+            end
 
-        local function localHash3(x, y, z)
-            return localHash(x * 12.9898 + y * 78.233 + z * 43758.5453)
-        end
+            -- 格點梯度快取（跨 pixel 存活的 upvalue）。
+            -- 相鄰 pixel 多半落在同一格 → 8 次 hash 與 24 次查表整組跳過。
+            -- 快取失效或環境被重建時 ccx 是 nil，比較必然不相等 → 重算，結果不變。
+            local ccx, ccy, ccz
+            local ax0, ay0, az0, ax1, ay1, az1, ax2, ay2, az2, ax3, ay3, az3
+            local ax4, ay4, az4, ax5, ay5, az5, ax6, ay6, az6, ax7, ay7, az7
 
-        -- Optimized gradient - reduced trig calls
-        local function localGrad3(hash_val, x, y, z)
-            local h_norm = (hash_val + 1.0) * 0.5
-            local angle = h_norm * 6.28318530718 -- 2*PI
-            local cos_a = math.cos(angle)
-            local sin_a = math.sin(angle)
-            return cos_a * x + sin_a * y + (cos_a * 0.707106781 + sin_a * 0.707106781) * z
-        end
+            local function perlin(px, py, pz)
+                local ix = px - px % 1
+                local iy = py - py % 1
+                local iz = pz - pz % 1
 
-        -- Inline Perlin Noise 3D（使用浮點座標）
-        local function localPerlinNoise3D(x, y, z)
-            -- Use float coordinates directly without integer grid
-            -- Get integer parts for corner positions
-            local X = math.floor(x)
-            local Y = math.floor(y)
-            local Z = math.floor(z)
+                if ix ~= ccx or iy ~= ccy or iz ~= ccz then
+                    ccx, ccy, ccz = ix, iy, iz
+                    local ix1, iy1, iz1 = ix + 1.0, iy + 1.0, iz + 1.0
+                    local t, g
 
-            -- Get fractional parts for interpolation
-            local fx = x - X
-            local fy = y - Y
-            local fz = z - Z
+                    t = mixi(ix, iy, iz) * HG
+                    g = t - t % 1 + 1
+                    ax0, ay0, az0 = GX[g], GY[g], GZ[g]
 
-            -- Calculate neighbor coordinates (continuous float space)
-            local X1 = X + 1.0
-            local Y1 = Y + 1.0
-            local Z1 = Z + 1.0
+                    t = mixi(ix1, iy, iz) * HG
+                    g = t - t % 1 + 1
+                    ax1, ay1, az1 = GX[g], GY[g], GZ[g]
 
-            local u = localFade(fx)
-            local v = localFade(fy)
-            local w = localFade(fz)
+                    t = mixi(ix, iy1, iz) * HG
+                    g = t - t % 1 + 1
+                    ax2, ay2, az2 = GX[g], GY[g], GZ[g]
 
-            -- Use float coordinates for hash (no modulo wrapping)
-            local h000 = localHash3(X, Y, Z)
-            local h001 = localHash3(X, Y, Z1)
-            local h010 = localHash3(X, Y1, Z)
-            local h011 = localHash3(X, Y1, Z1)
-            local h100 = localHash3(X1, Y, Z)
-            local h101 = localHash3(X1, Y, Z1)
-            local h110 = localHash3(X1, Y1, Z)
-            local h111 = localHash3(X1, Y1, Z1)
+                    t = mixi(ix1, iy1, iz) * HG
+                    g = t - t % 1 + 1
+                    ax3, ay3, az3 = GX[g], GY[g], GZ[g]
 
-            local AAA = localGrad3(h000, fx, fy, fz)
-            local ABA = localGrad3(h001, fx, fy, fz - 1.0)
-            local AAB = localGrad3(h010, fx, fy - 1.0, fz)
-            local ABB = localGrad3(h011, fx, fy - 1.0, fz - 1.0)
-            local BAA = localGrad3(h100, fx - 1.0, fy, fz)
-            local BBA = localGrad3(h101, fx - 1.0, fy, fz - 1.0)
-            local BAB = localGrad3(h110, fx - 1.0, fy - 1.0, fz)
-            local BBB = localGrad3(h111, fx - 1.0, fy - 1.0, fz - 1.0)
+                    t = mixi(ix, iy, iz1) * HG
+                    g = t - t % 1 + 1
+                    ax4, ay4, az4 = GX[g], GY[g], GZ[g]
 
-            return localLerp(
-                localLerp(
-                    localLerp(AAA, BAA, u),
-                    localLerp(ABA, BBA, u),
-                    w
-                ),
-                localLerp(
-                    localLerp(AAB, BAB, u),
-                    localLerp(ABB, BBB, u),
-                    w
-                ),
-                v
-            )
-        end
+                    t = mixi(ix1, iy, iz1) * HG
+                    g = t - t % 1 + 1
+                    ax5, ay5, az5 = GX[g], GY[g], GZ[g]
 
-        -- Inline Value Noise 3D
-        local function localValueNoise3D(x, y, z)
-            -- Use float coordinates directly without integer grid
-            -- Get integer parts for corner positions
-            local X = math.floor(x)
-            local Y = math.floor(y)
-            local Z = math.floor(z)
+                    t = mixi(ix, iy1, iz1) * HG
+                    g = t - t % 1 + 1
+                    ax6, ay6, az6 = GX[g], GY[g], GZ[g]
 
-            -- Get fractional parts for interpolation
-            local fx = x - X
-            local fy = y - Y
-            local fz = z - Z
+                    t = mixi(ix1, iy1, iz1) * HG
+                    g = t - t % 1 + 1
+                    ax7, ay7, az7 = GX[g], GY[g], GZ[g]
+                end
 
-            -- Calculate neighbor coordinates (continuous float space)
-            local X1 = X + 1.0
-            local Y1 = Y + 1.0
-            local Z1 = Z + 1.0
+                local fx = px - ix
+                local fy = py - iy
+                local fz = pz - iz
+                local fx1 = fx - 1.0
+                local fy1 = fy - 1.0
+                local fz1 = fz - 1.0
 
-            local u = localFade(fx)
-            local v = localFade(fy)
-            local w = localFade(fz)
+                -- 8 個角的梯度點積（全部展開，省下 8 次函式呼叫）
+                local n0 = ax0 * fx + ay0 * fy + az0 * fz
+                local n1 = ax1 * fx1 + ay1 * fy + az1 * fz
+                local n2 = ax2 * fx + ay2 * fy1 + az2 * fz
+                local n3 = ax3 * fx1 + ay3 * fy1 + az3 * fz
+                local n4 = ax4 * fx + ay4 * fy + az4 * fz1
+                local n5 = ax5 * fx1 + ay5 * fy + az5 * fz1
+                local n6 = ax6 * fx + ay6 * fy1 + az6 * fz1
+                local n7 = ax7 * fx1 + ay7 * fy1 + az7 * fz1
 
-            -- Use float coordinates for hash (no modulo wrapping)
-            local a = localHash3(X, Y, Z)
-            local b = localHash3(X1, Y, Z)
-            local c = localHash3(X, Y1, Z)
-            local d = localHash3(X1, Y1, Z)
-            local e = localHash3(X, Y, Z1)
-            local f = localHash3(X1, Y, Z1)
-            local g = localHash3(X, Y1, Z1)
-            local h = localHash3(X1, Y1, Z1)
+                -- fade + lerp 全部內聯
+                local u = fx * fx * fx * (fx * (fx * 6.0 - 15.0) + 10.0)
+                local v = fy * fy * fy * (fy * (fy * 6.0 - 15.0) + 10.0)
+                local w = fz * fz * fz * (fz * (fz * 6.0 - 15.0) + 10.0)
 
-            return localLerp(
-                localLerp(
-                    localLerp(a, b, u),
-                    localLerp(c, d, u),
-                    v
-                ),
-                localLerp(
-                    localLerp(e, f, u),
-                    localLerp(g, h, u),
-                    v
-                ),
-                w
-            )
-        end
+                local a = n0 + u * (n1 - n0)
+                local b = n2 + u * (n3 - n2)
+                local c = n4 + u * (n5 - n4)
+                local d = n6 + u * (n7 - n6)
+                local e = a + v * (b - a)
+                local f = c + v * (d - c)
 
-        -- Calculate time offset for animation (only used for noise types that support animation)
-        local timeOffset = CurrentTime * SeetheRate + Seethe
+                -- 1.1547 = 2/sqrt(3)，把理論範圍 ±sqrt(3)/2 歸一化到 ±1
+                return (e + w * (f - e)) * 1.1547005
+            end
 
-        -- Helper function to generate noise value with channel offset for RGB mode
-        local function generateNoise(channelOffsetX, channelOffsetY, channelOffsetZ)
-            local noiseVal = 0.0
-            local finalPosX = posX + channelOffsetX
-            local finalPosY = posY + channelOffsetY
-            local finalPosZ = posZ + channelOffsetZ + timeOffset
+            -- Value noise：同樣做格點快取，但存的是純量 hash 值
+            local vcx, vcy, vcz
+            local v0, v1, v2, v3, v4, v5, v6, v7
 
-            -- Optimized noise type selection with precomputed scales
-            if NoiseType == 0 then
-                -- Perlin Noise (supports animation)
-                noiseVal = localPerlinNoise3D(finalPosX * Scale * ScaleX, finalPosY * Scale * ScaleY,
-                    finalPosZ * Scale * ScaleZ)
-            elseif NoiseType == 1 then
-                -- Simplex Noise (simplified, using Perlin approximation) (supports animation)
-                local s = 0.707106781 -- sqrt(0.5) for Simplex
-                noiseVal = localPerlinNoise3D(finalPosX * Scale * ScaleX * s, finalPosY * Scale * ScaleY * s,
-                    finalPosZ * Scale * ScaleZ * s)
-            elseif NoiseType == 2 then
-                -- Value Noise (supports animation)
-                noiseVal = localValueNoise3D(finalPosX * Scale * ScaleX, finalPosY * Scale * ScaleY,
-                    finalPosZ * Scale * ScaleZ)
-            elseif NoiseType == 3 then
-                -- Worley Noise (cellular) - optimized with distance squared
-                local sx = finalPosX * Scale * ScaleX
-                local sy = finalPosY * Scale * ScaleY
-                local sz = finalPosZ * Scale * ScaleZ
-                local cellX = math.floor(sx)
-                local cellY = math.floor(sy)
-                local cellZ = math.floor(sz)
-                local minDistSq = math.huge
+            local function value(px, py, pz)
+                local ix = px - px % 1
+                local iy = py - py % 1
+                local iz = pz - pz % 1
+
+                if ix ~= vcx or iy ~= vcy or iz ~= vcz then
+                    vcx, vcy, vcz = ix, iy, iz
+                    local ix1, iy1, iz1 = ix + 1.0, iy + 1.0, iz + 1.0
+                    v0 = mixi(ix, iy, iz) * HV2 - 1.0
+                    v1 = mixi(ix1, iy, iz) * HV2 - 1.0
+                    v2 = mixi(ix, iy1, iz) * HV2 - 1.0
+                    v3 = mixi(ix1, iy1, iz) * HV2 - 1.0
+                    v4 = mixi(ix, iy, iz1) * HV2 - 1.0
+                    v5 = mixi(ix1, iy, iz1) * HV2 - 1.0
+                    v6 = mixi(ix, iy1, iz1) * HV2 - 1.0
+                    v7 = mixi(ix1, iy1, iz1) * HV2 - 1.0
+                end
+
+                local fx = px - ix
+                local fy = py - iy
+                local fz = pz - iz
+
+                local u = fx * fx * fx * (fx * (fx * 6.0 - 15.0) + 10.0)
+                local v = fy * fy * fy * (fy * (fy * 6.0 - 15.0) + 10.0)
+                local w = fz * fz * fz * (fz * (fz * 6.0 - 15.0) + 10.0)
+
+                local a = v0 + u * (v1 - v0)
+                local b = v2 + u * (v3 - v2)
+                local c = v4 + u * (v5 - v4)
+                local d = v6 + u * (v7 - v6)
+                local e = a + v * (b - a)
+                local f = c + v * (d - c)
+
+                return e + w * (f - e)
+            end
+
+            -- 真正的 3D Simplex（Gustavson）：只取 4 個角，比 Perlin 的 8 個少一半，
+            -- 而且沒有 Perlin 的軸向格狀偽影。
+            local F3 = 1.0 / 3.0
+            local G3 = 1.0 / 6.0
+            local G32 = 2.0 / 6.0
+            local G33 = 3.0 / 6.0 - 1.0
+
+            local function simplex(px, py, pz)
+                local s = (px + py + pz) * F3
+                local xs, ys, zs = px + s, py + s, pz + s
+                local i = xs - xs % 1
+                local j = ys - ys % 1
+                local k = zs - zs % 1
+
+                local t = (i + j + k) * G3
+                local x0 = px - (i - t)
+                local y0 = py - (j - t)
+                local z0 = pz - (k - t)
+
+                -- 判斷 x0>y0>z0 的排序，決定要走哪兩個中間角
+                local i1, j1, k1, i2, j2, k2
+                if x0 >= y0 then
+                    if y0 >= z0 then
+                        i1, j1, k1, i2, j2, k2 = 1, 0, 0, 1, 1, 0
+                    elseif x0 >= z0 then
+                        i1, j1, k1, i2, j2, k2 = 1, 0, 0, 1, 0, 1
+                    else
+                        i1, j1, k1, i2, j2, k2 = 0, 0, 1, 1, 0, 1
+                    end
+                else
+                    if y0 < z0 then
+                        i1, j1, k1, i2, j2, k2 = 0, 0, 1, 0, 1, 1
+                    elseif x0 < z0 then
+                        i1, j1, k1, i2, j2, k2 = 0, 1, 0, 0, 1, 1
+                    else
+                        i1, j1, k1, i2, j2, k2 = 0, 1, 0, 1, 1, 0
+                    end
+                end
+
+                local x1, y1, z1 = x0 - i1 + G3, y0 - j1 + G3, z0 - k1 + G3
+                local x2, y2, z2 = x0 - i2 + G32, y0 - j2 + G32, z0 - k2 + G32
+                local x3, y3, z3 = x0 + G33, y0 + G33, z0 + G33
+
+                local n = 0.0
+                local tt, g, gi
+
+                tt = 0.6 - x0 * x0 - y0 * y0 - z0 * z0
+                if tt > 0.0 then
+                    tt = tt * tt
+                    g = mixi(i, j, k) * HG
+                    gi = g - g % 1 + 1
+                    n = n + tt * tt * (GX[gi] * x0 + GY[gi] * y0 + GZ[gi] * z0)
+                end
+
+                tt = 0.6 - x1 * x1 - y1 * y1 - z1 * z1
+                if tt > 0.0 then
+                    tt = tt * tt
+                    g = mixi(i + i1, j + j1, k + k1) * HG
+                    gi = g - g % 1 + 1
+                    n = n + tt * tt * (GX[gi] * x1 + GY[gi] * y1 + GZ[gi] * z1)
+                end
+
+                tt = 0.6 - x2 * x2 - y2 * y2 - z2 * z2
+                if tt > 0.0 then
+                    tt = tt * tt
+                    g = mixi(i + i2, j + j2, k + k2) * HG
+                    gi = g - g % 1 + 1
+                    n = n + tt * tt * (GX[gi] * x2 + GY[gi] * y2 + GZ[gi] * z2)
+                end
+
+                tt = 0.6 - x3 * x3 - y3 * y3 - z3 * z3
+                if tt > 0.0 then
+                    tt = tt * tt
+                    g = mixi(i + 1.0, j + 1.0, k + 1.0) * HG
+                    gi = g - g % 1 + 1
+                    n = n + tt * tt * (GX[gi] * x3 + GY[gi] * y3 + GZ[gi] * z3)
+                end
+
+                return 32.0 * n
+            end
+
+            -- Worley（cellular）：一條 hash 鏈就產出 3 個抖動分量，
+            -- 取代原本每格 3 次獨立 hash。特徵點在格內均勻落在 [0,1)。
+            local function worley(px, py, pz)
+                local cx = px - px % 1
+                local cy = py - py % 1
+                local cz = pz - pz % 1
+                local best = 1e30
+
                 for k = -1, 1 do
+                    local nz = cz + k
+                    local bz = (nz % HFOLD) * 6971
                     for j = -1, 1 do
+                        local ny = cy + j
+                        local byz = bz + (ny % HFOLD) * 31337
                         for i = -1, 1 do
-                            local neighborX = cellX + i
-                            local neighborY = cellY + j
-                            local neighborZ = cellZ + k
-                            local pointX = neighborX + localHash3(neighborX, neighborY, neighborZ) * 0.5 + 0.25
-                            local pointY = neighborY + localHash3(neighborX + 1.0, neighborY, neighborZ) * 0.5 + 0.25
-                            local pointZ = neighborZ + localHash3(neighborX, neighborY + 1.0, neighborZ) * 0.5 + 0.25
-                            local dx = sx - pointX
-                            local dy = sy - pointY
-                            local dz = sz - pointZ
-                            local distSq = dx * dx + dy * dy + dz * dz
-                            if distSq < minDistSq then
-                                minDistSq = distSq
-                            end
+                            local nx = cx + i
+                            local n = (byz + (nx % HFOLD) * 1619) % HM
+                            n = (n * (n + 28411) + 12345) % HM
+                            local dx = px - nx - n * HIV
+                            n = (n * (n + 8121) + 6971) % HM
+                            local dy = py - ny - n * HIV
+                            n = (n * (n + 31337) + 1619) % HM
+                            local dz = pz - nz - n * HIV
+                            local d = dx * dx + dy * dy + dz * dz
+                            if d < best then best = d end
                         end
                     end
                 end
-                -- Only calculate sqrt once at the end
-                noiseVal = math.sqrt(minDistSq) * 2.0 - 1.0
-            elseif NoiseType == 4 then
-                -- FBM (Fractal Brownian Motion) - optimized loop (supports animation)
-                local value = 0.0
-                local amplitude = 1.0
-                local frequency = 1.0
-                local maxValue = 0.0
-                local posX_scaled = finalPosX * Scale * ScaleX
-                local posY_scaled = finalPosY * Scale * ScaleY
-                local posZ_scaled = finalPosZ * Scale * ScaleZ
-                for i = 0, Octaves - 1 do
-                    value = value +
-                        localPerlinNoise3D(posX_scaled * frequency, posY_scaled * frequency, posZ_scaled * frequency) *
-                        amplitude
-                    maxValue = maxValue + amplitude
-                    amplitude = amplitude * Persistence
-                    frequency = frequency * Lacunarity
-                end
-                noiseVal = value / maxValue
-            else
-                -- Default to Perlin (supports animation)
-                noiseVal = localPerlinNoise3D(finalPosX * Scale * ScaleX, finalPosY * Scale * ScaleY,
-                    finalPosZ * Scale * ScaleZ)
+
+                return sqrt(best) * 2.0 - 1.0
             end
 
-            -- Normalize from [-1, 1] to [0, 1] if needed, then remap to [minValue, maxValue]
-            noiseVal = (noiseVal + 1.0) * 0.5
-            noiseVal = localLerp(MinValue, MaxValue, noiseVal)
+            -- 會變動的值一律走參數，不讀全域 —— 這個 closure 會活過多次 Process 呼叫，
+            -- 讀全域有機會綁到過期的環境表。
+            N3D_gen = function(px, py, pz, nt, csx, csy, csz, oct, lac, per, mn, mx)
+                local sx = px * csx
+                local sy = py * csy
+                local sz = pz * csz
+                local nv
 
-            -- Clamp to valid range (optimized single-line clamp)
-            noiseVal = noiseVal < 0.0 and 0.0 or (noiseVal > 1.0 and 1.0 or noiseVal)
+                if nt == 0 then
+                    nv = perlin(sx, sy, sz)
+                elseif nt == 1 then
+                    -- Simplex 的自然特徵尺度只有 Perlin 的 0.483 倍、振幅高 1.22 倍
+                    -- （實測自相關距離與標準差得出）。補償後切換 Noise Type 時
+                    -- 圖案大小與對比度不會跳掉。
+                    nv = simplex(sx * 0.4834, sy * 0.4834, sz * 0.4834) * 0.8228
+                elseif nt == 2 then
+                    nv = value(sx, sy, sz)
+                elseif nt == 3 then
+                    nv = worley(sx, sy, sz)
+                elseif nt == 4 then
+                    -- FBM：每個 octave 之間平移定義域，消除 octave 對齊產生的偽影
+                    local amp = 1.0
+                    local tot = 0.0
+                    nv = 0.0
+                    for _ = 1, oct do
+                        nv = nv + perlin(sx, sy, sz) * amp
+                        tot = tot + amp
+                        amp = amp * per
+                        sx = sx * lac + 1.7
+                        sy = sy * lac + 9.2
+                        sz = sz * lac + 4.3
+                    end
+                    if tot > 0.0 then
+                        nv = nv / tot
+                    end
+                else
+                    nv = perlin(sx, sy, sz)
+                end
 
-            return noiseVal
+                -- [-1,1] → [0,1] → remap 到 [MinValue, MaxValue]
+                nv = mn + (mx - mn) * ((nv + 1.0) * 0.5)
+
+                if nv < 0.0 then
+                    return 0.0
+                elseif nv > 1.0 then
+                    return 1.0
+                end
+                return nv
+            end
+
+            gen = N3D_gen
+            -- ======================================================================
         end
 
-        -- Generate noise based on output mode
+        -- userData 注入的全域先讀進 local，RGB 模式的三次呼叫就能共用
+        local nt = NoiseType
+        local csx, csy, csz = CScaleX, CScaleY, CScaleZ
+        local oct, lac, per = Octaves, Lacunarity, Persistence
+        local mn, mx = MinValue, MaxValue
+
+        -- Extract RGB as XYZ position from input pixel
+        local posX = p.R + OffsetX
+        local posY = p.G + OffsetY
+        local posZ = p.B + OffsetZ + TimeOffset
+
         if OutputMode == 1 then
-            -- RGB mode: generate different noise for each channel using offsets
-            -- Use different offsets to create variation between channels
-            local offsetR = 100.0 -- Offset for Red channel
-            local offsetG = 200.0 -- Offset for Green channel
-            local offsetB = 300.0 -- Offset for Blue channel
-            p.R = generateNoise(offsetR, offsetR * 0.5, offsetR * 0.25)
-            p.G = generateNoise(offsetG, offsetG * 0.5, offsetG * 0.25)
-            p.B = generateNoise(offsetB, offsetB * 0.5, offsetB * 0.25)
+            -- RGB mode：三個通道各自位移，做出彼此不相關的 noise
+            p.R = gen(posX + 100.0, posY + 50.0, posZ + 25.0, nt, csx, csy, csz, oct, lac, per, mn, mx)
+            p.G = gen(posX + 200.0, posY + 100.0, posZ + 50.0, nt, csx, csy, csz, oct, lac, per, mn, mx)
+            p.B = gen(posX + 300.0, posY + 150.0, posZ + 75.0, nt, csx, csy, csz, oct, lac, per, mn, mx)
         else
-            -- Grayscale mode: same noise for all channels
-            local noiseValue = generateNoise(0.0, 0.0, 0.0)
-            p.R = noiseValue
-            p.G = noiseValue
-            p.B = noiseValue
+            local nv = gen(posX, posY, posZ, nt, csx, csy, csz, oct, lac, per, mn, mx)
+            p.R = nv
+            p.G = nv
+            p.B = nv
         end
         -- Alpha is preserved automatically by MultiProcessPixels
 
@@ -720,19 +636,18 @@ function Process(req)
     end
 
     -- Prepare userData - keys will be injected as globals in processPixel function
+    -- 這裡的 key 少於控制項數量：Scale*ScaleN 與 CurrentTime*SeetheRate+Seethe
+    -- 都已經在 Process 裡先算完，不需要在 pixel loop 重算。
     local userData = {
         OffsetX = offsetX,
         OffsetY = offsetY,
         OffsetZ = offsetZ,
+        TimeOffset = timeOffset,
         NoiseType = noiseType,
         OutputMode = outputMode,
-        Scale = scale,
-        ScaleX = scaleX,
-        ScaleY = scaleY,
-        ScaleZ = scaleZ,
-        Seethe = seethe,
-        SeetheRate = seetheRate,
-        CurrentTime = currentTime,
+        CScaleX = combinedScaleX,
+        CScaleY = combinedScaleY,
+        CScaleZ = combinedScaleZ,
         Octaves = octaves,
         Lacunarity = lacunarity,
         Persistence = persistence,
@@ -741,7 +656,7 @@ function Process(req)
     }
 
     -- Use MultiProcessPixels to process all pixels (automatically multi-threaded by Fusion)
-    out:MultiProcessPixels(nil, userData, DWleft, DWbottom, width, height, img_temp, processPixel)
+    out:MultiProcessPixels(nil, userData, DWleft, DWbottom, width, height, src, processPixel)
 
     OutImage:Set(req, out)
 end
