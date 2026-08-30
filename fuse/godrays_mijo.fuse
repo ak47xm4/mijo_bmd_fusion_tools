@@ -1,0 +1,478 @@
+-- Godrays mijo
+-- run in CPU
+--
+-- Nuke Godrays 的演算法：對每個輸出 pixel，沿著「單位變換 → 完整變換」
+-- 做 steps 次雙線性取樣，再平均（或逐通道取 max）。From/To Color 在 gamma
+-- 空間裡插值，乘在每一個 sample 上。
+--
+-- 與 Nuke 的差異（刻意的）：
+--   1. Center / Translate 用 Fusion 的 0–1 正規化座標，不是 pixel。
+--   2. translate / rotate / scale / skew 會合成，不像 Nuke 那樣互不相容。
+--   3. 正角度 = 逆時針（Fusion 慣例；Nuke 是負值順時針）。
+--   4. Mask / Mix 用 Fusion 內建的 Effect Mask 與 Blend，不重做 Nuke 那組。
+--
+-- MultiProcessPixels 規則與 noise_3D_mijo.fuse 相同：
+--   processPixel 只看得到 userData 的 key。helper 惰性建到 worker 全域
+--   （GRY_gen）；長存 closure 絕不讀全域，會變的值一律當參數傳入。
+--   threadinitfunc 幫每個 worker 配一個 Pixel，給 SamplePixelB 用。
+
+FuRegisterClass("Godrays_mijo", CT_Tool, {
+    REGS_Name = "Godrays mijo",
+    REGS_Category = "mijo",
+    REGS_OpIconString = "GRy",
+    REGS_OpDescription = "Nuke-style multi-sample smear along translate / rotate / scale / skew",
+    REG_NoObjMatCtrls = true,
+    REG_NoMotionBlurCtrls = true,
+    REG_SupportsDoD = true,
+})
+
+function Create()
+    InImage = self:AddInput("Input", "Input", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    InCenter = self:AddInput("Center", "Center", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "OffsetControl",
+        INPID_PreviewControl = "CrosshairControl",
+        INP_DefaultX = 0.5,
+        INP_DefaultY = 0.5,
+    })
+
+    -- Relative 0–1 offset. No CrosshairControl: default (0,0) would sit on the origin.
+    InTranslate = self:AddInput("Translate", "Translate", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "OffsetControl",
+        INP_DefaultX = 0.0,
+        INP_DefaultY = 0.0,
+    })
+
+    InRotate = self:AddInput("Rotate", "Rotate", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INPID_PreviewControl = "AngleControl",
+        INP_MinScale = -360.0,
+        INP_MaxScale = 360.0,
+        INP_Default = 0.0,
+        ACP_Center = InCenter,
+    })
+
+    InScale = self:AddInput("Scale", "Scale", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        INP_Default = 1.0,
+    })
+
+    InSkew = self:AddInput("Skew", "Skew", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -2.0,
+        INP_MaxScale = 2.0,
+        INP_Default = 0.0,
+    })
+
+    InFrom_R = self:AddInput("Red", "FromRed", {
+        ICS_Name = "From Color",
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        CLRC_ShowWheel = false,
+        INP_Default = 1.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        ICD_Center = 1.0,
+        IC_ControlGroup = 1,
+        IC_ControlID = 0,
+    })
+    InFrom_G = self:AddInput("Green", "FromGreen", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        INP_Default = 1.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        ICD_Center = 1.0,
+        IC_ControlGroup = 1,
+        IC_ControlID = 1,
+    })
+    InFrom_B = self:AddInput("Blue", "FromBlue", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        INP_Default = 1.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        ICD_Center = 1.0,
+        IC_ControlGroup = 1,
+        IC_ControlID = 2,
+    })
+
+    InTo_R = self:AddInput("Red", "ToRed", {
+        ICS_Name = "To Color",
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        CLRC_ShowWheel = false,
+        INP_Default = 1.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        ICD_Center = 1.0,
+        IC_ControlGroup = 2,
+        IC_ControlID = 0,
+    })
+    InTo_G = self:AddInput("Green", "ToGreen", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        INP_Default = 1.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        ICD_Center = 1.0,
+        IC_ControlGroup = 2,
+        IC_ControlID = 1,
+    })
+    InTo_B = self:AddInput("Blue", "ToBlue", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        INP_Default = 1.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        ICD_Center = 1.0,
+        IC_ControlGroup = 2,
+        IC_ControlID = 2,
+    })
+
+    InGamma = self:AddInput("Gamma", "Gamma", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.1,
+        INP_MaxScale = 4.0,
+        INP_Default = 1.0,
+    })
+
+    InSteps = self:AddInput("Steps", "Steps", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Integer = true,
+        INP_MinScale = 1.0,
+        INP_MaxScale = 64.0,
+        INP_Default = 16.0,
+    })
+
+    InMax = self:AddInput("Max", "Max", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 0.0,
+    })
+end
+
+-- IMG_DataWindow / IMG_ValidWindow 只接受 FuRectInt。fuse sandbox 沒有
+-- FuRectInt() 建構子，所以只用 Image / Request 已經給的 rect：
+--   img.DataWindow、GetInputDoD():Intersect()、GetRoI().ValidWindow。
+-- GetRoI() 本身是 ImageDomain，不能直接丟進 Image{}。
+local function outputWindows(req, img)
+    local datawnd = img.DataWindow
+    local dod = req:GetInputDoD(InImage)
+    if dod then
+        datawnd = dod:Intersect(datawnd)
+    end
+
+    local roi = req:GetRoI()
+    local validwnd = nil
+    if roi then
+        datawnd = roi:Intersect(datawnd)
+        validwnd = roi.ValidWindow
+    end
+    return datawnd, validwnd
+end
+
+function PrecalcProcess(req)
+    local img = InImage:GetValue(req)
+    if not img then
+        return
+    end
+
+    local datawnd = outputWindows(req, img)
+    local out = Image({
+        IMG_Like = img,
+        IMG_NoData = true,
+        IMG_DataWindow = datawnd,
+        IMG_Depth = IMG_Depth_Float,
+    })
+    if not out then
+        return
+    end
+    OutImage:Set(req, out)
+end
+
+function Process(req)
+    local img = InImage:GetValue(req)
+    if not img then
+        return
+    end
+
+    local center = InCenter:GetValue(req)
+    local translate = InTranslate:GetValue(req)
+    local rotate = InRotate:GetValue(req).Value
+    local scale = InScale:GetValue(req).Value
+    local skew = InSkew:GetValue(req).Value
+    local fromR = InFrom_R:GetValue(req).Value
+    local fromG = InFrom_G:GetValue(req).Value
+    local fromB = InFrom_B:GetValue(req).Value
+    local toR = InTo_R:GetValue(req).Value
+    local toG = InTo_G:GetValue(req).Value
+    local toB = InTo_B:GetValue(req).Value
+    local gamma = InGamma:GetValue(req).Value
+    local steps = InSteps:GetValue(req).Value
+    local useMax = InMax:GetValue(req).Value > 0.5
+
+    if steps < 1 then
+        steps = 1
+    elseif steps > 64 then
+        steps = 64
+    end
+    steps = steps - steps % 1
+
+    local width = img.Width
+    local height = img.Height
+    local cx = center.X * width
+    local cy = center.Y * height
+    local tx = translate.X * width
+    local ty = translate.Y * height
+
+    local datawnd, validwnd = outputWindows(req, img)
+
+    local DWleft = datawnd.left
+    local DWbottom = datawnd.bottom
+    local DWwidth = datawnd.right - DWleft
+    local DWheight = datawnd.top - DWbottom
+
+    if DWwidth <= 0 or DWheight <= 0 then
+        local out = Image({
+            IMG_Like = img,
+            IMG_NoData = true,
+            IMG_DataWindow = datawnd,
+            IMG_Depth = IMG_Depth_Float,
+        })
+        if out then
+            OutImage:Set(req, out)
+        end
+        return
+    end
+
+    -- Identity + white tint: no smear, just copy into the output window.
+    local identity = tx * tx + ty * ty < 1e-20
+        and rotate * rotate < 1e-20
+        and (scale - 1.0) * (scale - 1.0) < 1e-20
+        and skew * skew < 1e-20
+        and (fromR - 1.0) * (fromR - 1.0) < 1e-20
+        and (fromG - 1.0) * (fromG - 1.0) < 1e-20
+        and (fromB - 1.0) * (fromB - 1.0) < 1e-20
+        and (toR - 1.0) * (toR - 1.0) < 1e-20
+        and (toG - 1.0) * (toG - 1.0) < 1e-20
+        and (toB - 1.0) * (toB - 1.0) < 1e-20
+
+    if identity then
+        local out = Image({
+            IMG_Like = img,
+            IMG_DataWindow = datawnd,
+            IMG_ValidWindow = validwnd,
+            IMG_Depth = IMG_Depth_Float,
+            IMG_CopyChannels = true,
+        })
+        if not out then
+            return
+        end
+        img:Crop(out, {})
+        OutImage:Set(req, out)
+        return
+    end
+
+    local out = Image({
+        IMG_Like = img,
+        IMG_DataWindow = datawnd,
+        IMG_ValidWindow = validwnd,
+        IMG_Depth = IMG_Depth_Float,
+        IMG_NoData = true,
+    })
+    if not out then
+        return
+    end
+
+    -- ------------------------------------------------------------------------
+    -- Pixel function
+    --
+    -- MultiProcessPixels 在 worker context 執行：模組層的函式與 Process 的 local
+    -- 都看不到，只有 userData 的 key（加上 threadinitfunc 寫進環境的 Samp）
+    -- 會被注入成全域。GRY_gen 建到 worker 全域，之後的 pixel 直接重用。
+    -- ------------------------------------------------------------------------
+    local function processPixel(x, y, p)
+        local gen = GRY_gen
+
+        if not gen then
+            local sin = math.sin
+            local cos = math.cos
+            local DEG2RAD = 3.14159265358979323846 / 180.0
+            local SCALE_EPS = 1.0e-6
+
+            -- 會變動的值一律走參數，不讀全域 —— 這個 closure 會活過多次
+            -- Process 呼叫，讀全域有機會綁到過期的環境表。
+            --
+            -- Forward at t (source s → dest d):
+            --   v = s - C
+            --   skew:   x += (skew * t) * y
+            --   scale:  lerp(1, scale, t)
+            --   rotate: CCW by rotate * t degrees
+            --   d = v + C + Translate * t
+            -- Inverse is that sequence undone.
+            GRY_gen = function(px, py, src, samp, cx, cy, tx, ty, rot, sc, sk, n, doMax,
+                               fr, fg, fb, tr, tg, tb, g)
+                local accR, accG, accB, accA
+                if doMax then
+                    accR, accG, accB, accA = -1.0e37, -1.0e37, -1.0e37, -1.0e37
+                else
+                    accR, accG, accB, accA = 0.0, 0.0, 0.0, 0.0
+                end
+
+                if g < SCALE_EPS then
+                    g = SCALE_EPS
+                end
+                local useGamma = (g > 1.000001 or g < 0.999999)
+                local invG, frg, fgg, fbg, trg, tgg, tbg
+                if useGamma then
+                    invG = 1.0 / g
+                    frg, fgg, fbg = fr ^ g, fg ^ g, fb ^ g
+                    trg, tgg, tbg = tr ^ g, tg ^ g, tb ^ g
+                end
+
+                local denom = n - 1
+                if denom < 1 then
+                    denom = 1
+                end
+
+                for i = 0, n - 1 do
+                    local t = 0.0
+                    if n > 1 then
+                        t = i / denom
+                    end
+
+                    -- v = d - C - T*t
+                    local vx = px - cx - tx * t
+                    local vy = py - cy - ty * t
+
+                    -- inverse rotate (CCW by -rot*t)
+                    local ang = -rot * t * DEG2RAD
+                    local ca, sa = cos(ang), sin(ang)
+                    local rx = vx * ca - vy * sa
+                    local ry = vx * sa + vy * ca
+
+                    -- inverse scale; keep the interpolant off zero
+                    local st = 1.0 + t * (sc - 1.0)
+                    if st >= 0.0 then
+                        if st < SCALE_EPS then
+                            st = SCALE_EPS
+                        end
+                    elseif st > -SCALE_EPS then
+                        st = -SCALE_EPS
+                    end
+                    rx = rx / st
+                    ry = ry / st
+
+                    -- inverse horizontal skew: x -= (skew*t) * y
+                    rx = rx - (sk * t) * ry
+
+                    src:SamplePixelB(rx + cx, ry + cy, samp)
+
+                    local cr, cg, cb
+                    if useGamma then
+                        cr = (frg + t * (trg - frg)) ^ invG
+                        cg = (fgg + t * (tgg - fgg)) ^ invG
+                        cb = (fbg + t * (tbg - fbg)) ^ invG
+                    else
+                        cr = fr + t * (tr - fr)
+                        cg = fg + t * (tg - fg)
+                        cb = fb + t * (tb - fb)
+                    end
+
+                    local sr = samp.R * cr
+                    local sg = samp.G * cg
+                    local sb = samp.B * cb
+                    local sa = samp.A * (cr + cg + cb) * (1.0 / 3.0)
+
+                    if doMax then
+                        if sr > accR then accR = sr end
+                        if sg > accG then accG = sg end
+                        if sb > accB then accB = sb end
+                        if sa > accA then accA = sa end
+                    else
+                        accR = accR + sr
+                        accG = accG + sg
+                        accB = accB + sb
+                        accA = accA + sa
+                    end
+                end
+
+                if not doMax then
+                    local invN = 1.0 / n
+                    accR = accR * invN
+                    accG = accG * invN
+                    accB = accB * invN
+                    accA = accA * invN
+                end
+
+                return accR, accG, accB, accA
+            end
+
+            gen = GRY_gen
+        end
+
+        local r, g, b, a = gen(
+            x + 0.5, y + 0.5,
+            Src, Samp,
+            Cx, Cy, Tx, Ty,
+            Rot, Scale, Skew, Steps, UseMax,
+            FromR, FromG, FromB, ToR, ToG, ToB, Gamma
+        )
+        p.R = r
+        p.G = g
+        p.B = b
+        p.A = a
+        return p
+    end
+
+    local userData = {
+        Src = img,
+        Cx = cx,
+        Cy = cy,
+        Tx = tx,
+        Ty = ty,
+        Rot = rotate,
+        Scale = scale,
+        Skew = skew,
+        Steps = steps,
+        UseMax = useMax,
+        FromR = fromR,
+        FromG = fromG,
+        FromB = fromB,
+        ToR = toR,
+        ToG = toG,
+        ToB = toB,
+        Gamma = gamma,
+    }
+
+    out:MultiProcessPixels(
+        function()
+            Samp = Pixel()
+        end,
+        userData,
+        DWleft, DWbottom, DWwidth, DWheight,
+        img,
+        processPixel
+    )
+
+    OutImage:Set(req, out)
+end
