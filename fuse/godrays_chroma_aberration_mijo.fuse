@@ -14,6 +14,8 @@
 -- Mode = Smear    → 沿 t=0..1 平均（GodRays 式光譜拖尾，較像實鏡）
 --
 -- Alpha 永遠用原像素，不參與 smear。
+-- 預設不 minify：scale < 1 會往畫框外取樣，Black 會把縮小的通道填成 0，
+-- 畫框變成一整圈純紅／純藍。三通道一起抬到 min(scale)=1，相對色差不變。
 --
 -- MultiProcessPixels 規則與 godrays_mijo.fuse 相同：
 --   processPixel 只看得到 userData 的 key。helper 惰性建到 worker 全域
@@ -53,10 +55,22 @@ function Create()
     InAmount = self:AddInput("Amount", "Amount", {
         LINKID_DataType = "Number",
         INPID_InputControl = "SliderControl",
-        INP_MinScale = 0.0,
+        INP_MinScale = -2.0,
         INP_MaxScale = 2.0,
         INP_Default = 1.0,
-        INPS_StatusText = "Master intensity. 0 is a copy; scales radial, linear, match and axial together.",
+        ICD_Center = 0.0,
+        INPS_StatusText = "Master intensity. Sign flips the spectrum. 0 is a copy.",
+    })
+
+    InFringe = self:AddInput("Fringe", "Fringe", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "MultiButtonControl",
+        INP_Integer = true,
+        INP_Default = 0.0,
+        MBTNC_StretchToFit = true,
+        { MBTNC_AddButton = "Red out",  MBTNCD_ButtonWidth = 0.5 },
+        { MBTNC_AddButton = "Blue out", MBTNCD_ButtonWidth = 0.5 },
+        INPS_StatusText = "Positive Amount: Red out = R magnified (RCA). Blue out = B magnified (simple-lens / LCA).",
     })
 
     InMode = self:AddInput("Mode", "Mode", {
@@ -94,6 +108,15 @@ function Create()
         INP_Default = 0.5,
         INPS_StatusText =
         "Scale offset as percent of radius at Outer=1, Amount=1, Weight=1. 0.5% ~ a few pixels at 1080p corners.",
+    })
+
+    InAllowMinify = self:AddInput("Allow Minify", "AllowMinify", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 0.0,
+        INPS_StatusText =
+        "Off (default): lift all RGB scales so none go below 1 — no solid red/blue frame from sampling black outside. On: true minify, for plates with overscan.",
     })
 
     InPower = self:AddInput("Power", "Power", {
@@ -163,7 +186,7 @@ function Create()
         INP_MaxScale = 2.0,
         INP_Default = 1.0,
         ICD_Center = 0.0,
-        INPS_StatusText = "Channel multiplier. + = scale out / shift with Angle. Default +1 / 0 / -1 is red-out blue-in.",
+        INPS_StatusText = "Channel multiplier. Combined with Fringe. Default +1 / 0 / -1 is the RCA shape.",
     })
 
     InGreenW = self:AddInput("Green Weight", "GreenWeight", {
@@ -326,13 +349,14 @@ function Create()
         LINKID_DataType = "Number",
         INPID_InputControl = "ComboControl",
         INP_Integer = true,
-        INP_Default = 1.0,
+        INP_Default = 0.0,
         INP_MinScale = 0.0,
         INP_MaxScale = 2.0,
-        { CCS_AddString = "Black" },
         { CCS_AddString = "Clamp" },
+        { CCS_AddString = "Black" },
         { CCS_AddString = "Wrap" },
-        INPS_StatusText = "Out-of-bounds sample: Black (transparent), Clamp to edge, or Wrap.",
+        INPS_StatusText =
+        "Out-of-bounds sample. Clamp (default) keeps both primaries at the frame. Black makes a solid red/blue border.",
     })
 end
 
@@ -389,9 +413,11 @@ function Process(req)
 
     local center = InCenter:GetValue(req)
     local amount = InAmount:GetValue(req).Value
+    local fringe = InFringe:GetValue(req).Value
     local mode = InMode:GetValue(req).Value
     local steps = InSteps:GetValue(req).Value
     local radial = InRadial:GetValue(req).Value
+    local allowMinify = InAllowMinify:GetValue(req).Value > 0.5
     local power = InPower:GetValue(req).Value
     local inner = InInner:GetValue(req).Value
     local outer = InOuter:GetValue(req).Value
@@ -401,6 +427,10 @@ function Process(req)
     local wR = InRedW:GetValue(req).Value
     local wG = InGreenW:GetValue(req).Value
     local wB = InBlueW:GetValue(req).Value
+    -- Blue out = invert the RCA shape so +Amount magnifies blue.
+    if fringe > 0.5 then
+        wR, wG, wB = -wR, -wG, -wB
+    end
     local linear = InLinear:GetValue(req).Value
     local linAng = InLinearAngle:GetValue(req).Value
     local linFall = InLinFalloff:GetValue(req).Value > 0.5
@@ -544,9 +574,9 @@ function Process(req)
 
             local function sampleAt(src, samp, sx, sy, edgeMode)
                 if edgeMode < 0.5 then
-                    src:SamplePixelB(sx, sy, samp)
-                elseif edgeMode < 1.5 then
                     src:SamplePixelD(sx, sy, samp)
+                elseif edgeMode < 1.5 then
+                    src:SamplePixelB(sx, sy, samp)
                 else
                     src:SamplePixelW(sx, sy, samp)
                 end
@@ -599,19 +629,15 @@ function Process(req)
                 return vx + cx, vy + cy
             end
 
-            -- Built once per worker. w (falloff) is an argument, not a closed-over global.
-            local function channel(px, py, src, samp, ch, orig, weight, etx, ety, erot, esc,
-                                   w, cx, cy, amount, rad, ana, fca, fsa,
-                                   linX, linY, linFall, smear, n, edge, axial)
-                local extraId = etx * etx + ety * ety + erot * erot
-                    + (esc - 1.0) * (esc - 1.0) < 1.0e-20
-                if extraId and weight * weight < 1.0e-20 then
-                    return orig
-                end
-
+            -- Built once per worker. Falloff / scales are arguments, not closed-over globals.
+            local function makeScale(amount, rad, weight, w, esc)
                 local sc = 1.0 + rad * amount * weight * w
-                sc = sc * (1.0 + amount * (esc - 1.0))
+                return sc * (1.0 + amount * (esc - 1.0))
+            end
 
+            local function channel(px, py, src, samp, ch, orig, weight, etx, ety, erot,
+                                   sc, w, cx, cy, amount, ana, fca, fsa,
+                                   linX, linY, linFall, smear, n, edge, axial)
                 local lf = 1.0
                 if linFall then
                     lf = w
@@ -620,6 +646,13 @@ function Process(req)
                 local ty = linY * amount * weight * lf + ety * amount
                 local rot = erot * amount
                 local ax = axial * amount * abs(weight)
+
+                if ax <= 0.01
+                    and rot * rot < 1.0e-20
+                    and tx * tx + ty * ty < 1.0e-20
+                    and (sc - 1.0) * (sc - 1.0) < 1.0e-20 then
+                    return orig
+                end
 
                 local acc = 0.0
                 local denom = n - 1
@@ -660,7 +693,7 @@ function Process(req)
                                amount, rad, wr, wg, wb,
                                inner, outer, pwr, aspect, ana, fca, fsa,
                                linX, linY, linFall,
-                               smear, n, edge, axial,
+                               smear, n, edge, axial, allowMinify,
                                rtx, rty, rrot, rsc,
                                gtx, gty, grot, gsc,
                                btx, bty, brot, bsc,
@@ -678,14 +711,34 @@ function Process(req)
                 end
                 local w = u ^ pwr
 
-                local r = channel(px, py, src, samp, 0, oR, wr, rtx, rty, rrot, rsc,
-                    w, cx, cy, amount, rad, ana, fca, fsa,
+                local scR = makeScale(amount, rad, wr, w, rsc)
+                local scG = makeScale(amount, rad, wg, w, gsc)
+                local scB = makeScale(amount, rad, wb, w, bsc)
+
+                -- Minify (scale < 1) samples *away* from center, i.e. off the frame.
+                -- That fills the shrinking channel with Black and paints a solid
+                -- primary border. Lift all three scales so min == 1; relative
+                -- R/G/B split is unchanged, the whole field is a tiny zoom-in.
+                if not allowMinify then
+                    local m = scR
+                    if scG < m then m = scG end
+                    if scB < m then m = scB end
+                    if m < 1.0 then
+                        local lift = 1.0 - m
+                        scR = scR + lift
+                        scG = scG + lift
+                        scB = scB + lift
+                    end
+                end
+
+                local r = channel(px, py, src, samp, 0, oR, wr, rtx, rty, rrot,
+                    scR, w, cx, cy, amount, ana, fca, fsa,
                     linX, linY, linFall, smear, n, edge, axial)
-                local g = channel(px, py, src, samp, 1, oG, wg, gtx, gty, grot, gsc,
-                    w, cx, cy, amount, rad, ana, fca, fsa,
+                local g = channel(px, py, src, samp, 1, oG, wg, gtx, gty, grot,
+                    scG, w, cx, cy, amount, ana, fca, fsa,
                     linX, linY, linFall, smear, n, edge, axial)
-                local b = channel(px, py, src, samp, 2, oB, wb, btx, bty, brot, bsc,
-                    w, cx, cy, amount, rad, ana, fca, fsa,
+                local b = channel(px, py, src, samp, 2, oB, wb, btx, bty, brot,
+                    scB, w, cx, cy, amount, ana, fca, fsa,
                     linX, linY, linFall, smear, n, edge, axial)
 
                 if preserve > 1.0e-6 then
@@ -712,7 +765,7 @@ function Process(req)
             Amount, Rad, WR, WG, WB,
             Inner, Outer, Pwr, Aspect, Ana, FCa, FSa,
             LinX, LinY, LinFall,
-            Smear, Steps, Edge, Axial,
+            Smear, Steps, Edge, Axial, AllowMinify,
             RTx, RTy, RRot, RSc,
             GTx, GTy, GRot, GSc,
             BTx, BTy, BRot, BSc,
@@ -749,6 +802,7 @@ function Process(req)
         Steps = steps,
         Edge = edge,
         Axial = axial,
+        AllowMinify = allowMinify,
         RTx = rtx,
         RTy = rty,
         RRot = rRot,
