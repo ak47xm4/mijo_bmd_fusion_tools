@@ -1,0 +1,778 @@
+-- Godrays Chroma Aberration mijo
+-- run in CPU
+--
+-- 把 Godrays 的「沿變換路徑多採樣」改成專業 compositor 用的色差。
+-- 參考：Nuke fxT_chromaticAberration（GodRays vs Transform）、Foundry Blink
+-- ChromaticAberration（transverse + axial）、Ray CA（per-channel scale / clear center）。
+--
+-- 每個輸出 pixel、每個 RGB 通道各自做一次 inverse transform 取樣：
+--   Transverse：沿光軸的徑向 scale（天然中心為 0，角落最大）
+--   Linear    ：稜鏡式平移（可選套 falloff）
+--   Match     ：逐通道 translate / rotate / scale，用來對 plate
+--   Axial     ：便宜的 LoCA（在最終取樣點做 plus-tap）
+-- Mode = Transform → 每通道 1 次（硬分離）
+-- Mode = Smear    → 沿 t=0..1 平均（GodRays 式光譜拖尾，較像實鏡）
+--
+-- Alpha 永遠用原像素，不參與 smear。
+--
+-- MultiProcessPixels 規則與 godrays_mijo.fuse 相同：
+--   processPixel 只看得到 userData 的 key。helper 惰性建到 worker 全域
+--   （GCA_gen）；長存 closure 絕不讀全域，會變的值一律當參數傳入。
+--   threadinitfunc 幫每個 worker 配一個 Pixel，給 SamplePixel* 用。
+
+FuRegisterClass("GodraysChromaAberration_mijo", CT_Tool, {
+    REGS_Name = "Godrays Chroma Aberration mijo",
+    REGS_Category = "mijo",
+    REGS_OpIconString = "GCA",
+    REGS_OpDescription = "Per-channel radial / linear chromatic aberration with GodRays smear",
+    REG_NoObjMatCtrls = true,
+    REG_NoMotionBlurCtrls = true,
+    REG_SupportsDoD = true,
+})
+
+function Create()
+    InImage = self:AddInput("Input", "Input", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    InCenter = self:AddInput("Center", "Center", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "OffsetControl",
+        INPID_PreviewControl = "CrosshairControl",
+        INP_DefaultX = 0.5,
+        INP_DefaultY = 0.5,
+        INPS_StatusText = "Optical axis. Radial CA is zero here and grows toward the corners.",
+    })
+
+    InAmount = self:AddInput("Amount", "Amount", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 2.0,
+        INP_Default = 1.0,
+        INPS_StatusText = "Master intensity. 0 is a copy; scales radial, linear, match and axial together.",
+    })
+
+    InMode = self:AddInput("Mode", "Mode", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "MultiButtonControl",
+        INP_Integer = true,
+        INP_Default = 1.0,
+        INP_DoNotifyChanged = true,
+        MBTNC_StretchToFit = true,
+        { MBTNC_AddButton = "Transform", MBTNCD_ButtonWidth = 0.5 },
+        { MBTNC_AddButton = "Smear",     MBTNCD_ButtonWidth = 0.5 },
+        INPS_StatusText = "Transform: one sample per channel (hard split). Smear: GodRays-style average along the path.",
+    })
+
+    InSteps = self:AddInput("Steps", "Steps", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Integer = true,
+        INP_MinScale = 1.0,
+        INP_MaxScale = 32.0,
+        INP_Default = 8.0,
+        INPS_StatusText = "Smear samples per channel. 1 equals Transform. Higher = smoother fringe, slower.",
+    })
+
+    -- ------------------------------------------------------------------
+    -- Radial / transverse CA
+    -- ------------------------------------------------------------------
+    self:BeginControlNest("Radial (Transverse)", "RadialNest", true)
+
+    InRadial = self:AddInput("Radial (%)", "Radial", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 5.0,
+        INP_Default = 0.5,
+        INPS_StatusText =
+        "Scale offset as percent of radius at Outer=1, Amount=1, Weight=1. 0.5% ~ a few pixels at 1080p corners.",
+    })
+
+    InPower = self:AddInput("Power", "Power", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.25,
+        INP_MaxScale = 4.0,
+        INP_Default = 1.0,
+        INPS_StatusText = "Falloff curve. 1 = linear with field angle (physical TCA). >1 pushes fringe into the corners.",
+    })
+
+    InInner = self:AddInput("Inner", "Inner", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 0.0,
+        INPS_StatusText =
+        "Clear-center radius. 0–1 in units of the image half-diagonal. Real lenses are cleaner on axis.",
+    })
+
+    InOuter = self:AddInput("Outer", "Outer", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 2.0,
+        INP_Default = 1.0,
+        INPS_StatusText = "Radius where falloff reaches 1. 1 = image corner if Center is the frame center.",
+    })
+
+    InAspect = self:AddInput("Aspect", "Aspect", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.25,
+        INP_MaxScale = 4.0,
+        INP_Default = 1.0,
+        INPS_StatusText = "Falloff ellipse. <1 = wider (anamorphic-style mask), >1 = taller.",
+    })
+
+    InAnamorphic = self:AddInput("Anamorphic", "Anamorphic", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 0.0,
+        INPS_StatusText = "0 = spherical radial CA. 1 = horizontal-only displacement (anamorphic / squeezed).",
+    })
+
+    InFieldRotate = self:AddInput("Field Rotate", "FieldRotate", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_MinScale = -180.0,
+        INP_MaxScale = 180.0,
+        INP_Default = 0.0,
+        INPS_StatusText = "Rotates the falloff ellipse and the anamorphic axis. Leave at 0 for spherical.",
+    })
+
+    self:EndControlNest()
+
+    -- ------------------------------------------------------------------
+    -- Spectrum weights (classic RCA: R out, G still, B in)
+    -- ------------------------------------------------------------------
+    InRedW = self:AddInput("Red Weight", "RedWeight", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -2.0,
+        INP_MaxScale = 2.0,
+        INP_Default = 1.0,
+        ICD_Center = 0.0,
+        INPS_StatusText = "Channel multiplier. + = scale out / shift with Angle. Default +1 / 0 / -1 is red-out blue-in.",
+    })
+
+    InGreenW = self:AddInput("Green Weight", "GreenWeight", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -2.0,
+        INP_MaxScale = 2.0,
+        INP_Default = 0.0,
+        ICD_Center = 0.0,
+        INPS_StatusText = "Usually 0 so green stays the reference. Nudge it if the plate's G also fringes.",
+    })
+
+    InBlueW = self:AddInput("Blue Weight", "BlueWeight", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -2.0,
+        INP_MaxScale = 2.0,
+        INP_Default = -1.0,
+        ICD_Center = 0.0,
+        INPS_StatusText = "Negative of Red Weight swaps the fringe (blue-out / LCA look).",
+    })
+
+    -- ------------------------------------------------------------------
+    -- Linear / prism / lateral shift
+    -- ------------------------------------------------------------------
+    self:BeginControlNest("Linear (Prism)", "LinearNest", true)
+
+    InLinear = self:AddInput("Linear", "Linear", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 0.05,
+        INP_Default = 0.0,
+        INPS_StatusText = "Normalized lateral shift. 0.01 = 1% of frame. Independent of radius unless Falloff is on.",
+    })
+
+    InLinearAngle = self:AddInput("Angle", "LinearAngle", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INPID_PreviewControl = "AngleControl",
+        INP_MinScale = -360.0,
+        INP_MaxScale = 360.0,
+        INP_Default = 0.0,
+        ACP_Center = InCenter,
+        INPS_StatusText = "Prism direction. 0 = right, 90 = up (Fusion CCW).",
+    })
+
+    InLinFalloff = self:AddInput("Falloff Affects Linear", "LinearFalloff", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 0.0,
+        INPS_StatusText =
+        "Off: uniform prism (cheap-filter look). On: linear shift uses the same center falloff as radial.",
+    })
+
+    self:EndControlNest()
+
+    -- ------------------------------------------------------------------
+    -- Per-channel match (absolute, still scaled by Amount)
+    -- ------------------------------------------------------------------
+    self:BeginControlNest("Per-Channel Match", "MatchNest", false)
+
+    InRShift = self:AddInput("Red Shift", "RedShift", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "OffsetControl",
+        INP_DefaultX = 0.0,
+        INP_DefaultY = 0.0,
+        INPS_StatusText = "Extra red translate in 0–1 frame units. For matching a plate, not radial CA.",
+    })
+    InGShift = self:AddInput("Green Shift", "GreenShift", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "OffsetControl",
+        INP_DefaultX = 0.0,
+        INP_DefaultY = 0.0,
+        INPS_StatusText = "Extra green translate in 0–1 frame units.",
+    })
+    InBShift = self:AddInput("Blue Shift", "BlueShift", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "OffsetControl",
+        INP_DefaultX = 0.0,
+        INP_DefaultY = 0.0,
+        INPS_StatusText = "Extra blue translate in 0–1 frame units.",
+    })
+
+    InRRot = self:AddInput("Red Rotate", "RedRotate", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_MinScale = -45.0,
+        INP_MaxScale = 45.0,
+        INP_Default = 0.0,
+        INPS_StatusText = "Extra red rotation around Center, in degrees.",
+    })
+    InGRot = self:AddInput("Green Rotate", "GreenRotate", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_MinScale = -45.0,
+        INP_MaxScale = 45.0,
+        INP_Default = 0.0,
+        INPS_StatusText = "Extra green rotation around Center, in degrees.",
+    })
+    InBRot = self:AddInput("Blue Rotate", "BlueRotate", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_MinScale = -45.0,
+        INP_MaxScale = 45.0,
+        INP_Default = 0.0,
+        INPS_StatusText = "Extra blue rotation around Center, in degrees.",
+    })
+
+    InRSc = self:AddInput("Red Scale", "RedScale", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.5,
+        INP_MaxScale = 1.5,
+        INP_Default = 1.0,
+        INPS_StatusText = "Extra red scale around Center. Multiplies the radial scale. 1 = no extra.",
+    })
+    InGSc = self:AddInput("Green Scale", "GreenScale", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.5,
+        INP_MaxScale = 1.5,
+        INP_Default = 1.0,
+        INPS_StatusText = "Extra green scale around Center. Multiplies the radial scale. 1 = no extra.",
+    })
+    InBSc = self:AddInput("Blue Scale", "BlueScale", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.5,
+        INP_MaxScale = 1.5,
+        INP_Default = 1.0,
+        INPS_StatusText = "Extra blue scale around Center. Multiplies the radial scale. 1 = no extra.",
+    })
+
+    self:EndControlNest()
+
+    -- ------------------------------------------------------------------
+    -- Axial + output
+    -- ------------------------------------------------------------------
+    InAxial = self:AddInput("Axial", "Axial", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 16.0,
+        INP_Default = 0.0,
+        INPS_StatusText = "Cheap LoCA: plus-tap blur in pixels, weighted by |channel|. 0 = off. Not a real defocus.",
+    })
+
+    InPreserveLuma = self:AddInput("Preserve Luma", "PreserveLuma", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 0.0,
+        INPS_StatusText = "Re-applies source Rec.709 luma after the split so the plate doesn't darken. 0 = off.",
+    })
+
+    InEdge = self:AddInput("Edge", "Edge", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 1.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 2.0,
+        { CCS_AddString = "Black" },
+        { CCS_AddString = "Clamp" },
+        { CCS_AddString = "Wrap" },
+        INPS_StatusText = "Out-of-bounds sample: Black (transparent), Clamp to edge, or Wrap.",
+    })
+end
+
+function NotifyChanged(inp, param, time)
+    if inp == InMode and param and type(param.Value) == "number" then
+        InSteps:SetAttrs({ IC_Visible = param.Value > 0.5 })
+    end
+end
+
+-- IMG_DataWindow / IMG_ValidWindow 只接受 FuRectInt。fuse sandbox 沒有
+-- FuRectInt() 建構子，所以只用 Image / Request 已經給的 rect：
+--   img.DataWindow、GetInputDoD():Intersect()、GetRoI().ValidWindow。
+-- GetRoI() 本身是 ImageDomain，不能直接丟進 Image{}。
+local function outputWindows(req, img)
+    local datawnd = img.DataWindow
+    local dod = req:GetInputDoD(InImage)
+    if dod then
+        datawnd = dod:Intersect(datawnd)
+    end
+
+    local roi = req:GetRoI()
+    local validwnd = nil
+    if roi then
+        datawnd = roi:Intersect(datawnd)
+        validwnd = roi.ValidWindow
+    end
+    return datawnd, validwnd
+end
+
+function PrecalcProcess(req)
+    local img = InImage:GetValue(req)
+    if not img then
+        return
+    end
+
+    local datawnd = outputWindows(req, img)
+    local out = Image({
+        IMG_Like = img,
+        IMG_NoData = true,
+        IMG_DataWindow = datawnd,
+        IMG_Depth = IMG_Depth_Float,
+    })
+    if not out then
+        return
+    end
+    OutImage:Set(req, out)
+end
+
+function Process(req)
+    local img = InImage:GetValue(req)
+    if not img then
+        return
+    end
+
+    local center = InCenter:GetValue(req)
+    local amount = InAmount:GetValue(req).Value
+    local mode = InMode:GetValue(req).Value
+    local steps = InSteps:GetValue(req).Value
+    local radial = InRadial:GetValue(req).Value
+    local power = InPower:GetValue(req).Value
+    local inner = InInner:GetValue(req).Value
+    local outer = InOuter:GetValue(req).Value
+    local aspect = InAspect:GetValue(req).Value
+    local ana = InAnamorphic:GetValue(req).Value
+    local fieldRot = InFieldRotate:GetValue(req).Value
+    local wR = InRedW:GetValue(req).Value
+    local wG = InGreenW:GetValue(req).Value
+    local wB = InBlueW:GetValue(req).Value
+    local linear = InLinear:GetValue(req).Value
+    local linAng = InLinearAngle:GetValue(req).Value
+    local linFall = InLinFalloff:GetValue(req).Value > 0.5
+    local rShift = InRShift:GetValue(req)
+    local gShift = InGShift:GetValue(req)
+    local bShift = InBShift:GetValue(req)
+    local rRot = InRRot:GetValue(req).Value
+    local gRot = InGRot:GetValue(req).Value
+    local bRot = InBRot:GetValue(req).Value
+    local rSc = InRSc:GetValue(req).Value
+    local gSc = InGSc:GetValue(req).Value
+    local bSc = InBSc:GetValue(req).Value
+    local axial = InAxial:GetValue(req).Value
+    local preserve = InPreserveLuma:GetValue(req).Value
+    local edge = InEdge:GetValue(req).Value
+
+    if steps < 1 then
+        steps = 1
+    elseif steps > 32 then
+        steps = 32
+    end
+    steps = steps - steps % 1
+
+    if power < 0.01 then
+        power = 0.01
+    end
+    if aspect < 0.01 then
+        aspect = 0.01
+    end
+    if ana < 0.0 then
+        ana = 0.0
+    elseif ana > 1.0 then
+        ana = 1.0
+    end
+    if inner < 0.0 then
+        inner = 0.0
+    end
+    if outer < inner + 1.0e-4 then
+        outer = inner + 1.0e-4
+    end
+
+    -- Transform mode: one sample at t=1. Smear uses Steps along 0..1.
+    local smear = mode > 0.5
+    if not smear then
+        steps = 1
+    end
+
+    local width = img.Width
+    local height = img.Height
+    local cx = center.X * width
+    local cy = center.Y * height
+    local rRef = 0.5 * math.sqrt(width * width + height * height)
+    if rRef < 1.0 then
+        rRef = 1.0
+    end
+
+    local DEG2RAD = 3.14159265358979323846 / 180.0
+    local fa = fieldRot * DEG2RAD
+    local fca, fsa = math.cos(fa), math.sin(fa)
+
+    local rad = radial * 0.01
+    local la = linAng * DEG2RAD
+    local linX = linear * width * math.cos(la)
+    local linY = linear * height * math.sin(la)
+
+    local rtx = rShift.X * width
+    local rty = rShift.Y * height
+    local gtx = gShift.X * width
+    local gty = gShift.Y * height
+    local btx = bShift.X * width
+    local bty = bShift.Y * height
+
+    local datawnd, validwnd = outputWindows(req, img)
+
+    local DWleft = datawnd.left
+    local DWbottom = datawnd.bottom
+    local DWwidth = datawnd.right - DWleft
+    local DWheight = datawnd.top - DWbottom
+
+    if DWwidth <= 0 or DWheight <= 0 then
+        local out = Image({
+            IMG_Like = img,
+            IMG_NoData = true,
+            IMG_DataWindow = datawnd,
+            IMG_Depth = IMG_Depth_Float,
+        })
+        if out then
+            OutImage:Set(req, out)
+        end
+        return
+    end
+
+    -- Amount is the master; everything else is scaled by it.
+    local identity = amount * amount < 1.0e-20
+
+    if identity then
+        local out = Image({
+            IMG_Like = img,
+            IMG_DataWindow = datawnd,
+            IMG_ValidWindow = validwnd,
+            IMG_Depth = IMG_Depth_Float,
+            IMG_CopyChannels = true,
+        })
+        if not out then
+            return
+        end
+        img:Crop(out, {})
+        OutImage:Set(req, out)
+        return
+    end
+
+    local out = Image({
+        IMG_Like = img,
+        IMG_DataWindow = datawnd,
+        IMG_ValidWindow = validwnd,
+        IMG_Depth = IMG_Depth_Float,
+        IMG_NoData = true,
+    })
+    if not out then
+        return
+    end
+
+    -- ------------------------------------------------------------------------
+    -- Pixel function
+    --
+    -- MultiProcessPixels 在 worker context 執行：模組層的函式與 Process 的 local
+    -- 都看不到，只有 userData 的 key（加上 threadinitfunc 寫進環境的 Samp）
+    -- 會被注入成全域。GCA_gen 建到 worker 全域，之後的 pixel 直接重用。
+    -- ------------------------------------------------------------------------
+    local function processPixel(x, y, p)
+        local gen = GCA_gen
+
+        if not gen then
+            local sin = math.sin
+            local cos = math.cos
+            local sqrt = math.sqrt
+            local abs = math.abs
+            local DEG = 3.14159265358979323846 / 180.0
+            local EPS = 1.0e-6
+            local YR, YG, YB = 0.2126, 0.7152, 0.0722
+
+            local function sampleAt(src, samp, sx, sy, edgeMode)
+                if edgeMode < 0.5 then
+                    src:SamplePixelB(sx, sy, samp)
+                elseif edgeMode < 1.5 then
+                    src:SamplePixelD(sx, sy, samp)
+                else
+                    src:SamplePixelW(sx, sy, samp)
+                end
+            end
+
+            local function take(samp, ch)
+                if ch < 0.5 then
+                    return samp.R
+                elseif ch < 1.5 then
+                    return samp.G
+                end
+                return samp.B
+            end
+
+            -- Inverse of: field-rotate → anamorphic scale → un-field-rotate
+            -- → channel rotate → translate. t lerps from identity to full.
+            local function inv(px, py, cx, cy, tx, ty, rot, sc, ana, fca, fsa, t)
+                local vx = px - cx - tx * t
+                local vy = py - cy - ty * t
+
+                if rot * rot > 1.0e-20 then
+                    local ang = -rot * t * DEG
+                    local ca, sa = cos(ang), sin(ang)
+                    local rx = vx * ca - vy * sa
+                    local ry = vx * sa + vy * ca
+                    vx, vy = rx, ry
+                end
+
+                local fx = vx * fca + vy * fsa
+                local fy = -vx * fsa + vy * fca
+
+                local st = 1.0 + t * (sc - 1.0)
+                local stx = st
+                local sty = 1.0 + t * (sc - 1.0) * (1.0 - ana)
+                if stx >= 0.0 then
+                    if stx < EPS then stx = EPS end
+                elseif stx > -EPS then
+                    stx = -EPS
+                end
+                if sty >= 0.0 then
+                    if sty < EPS then sty = EPS end
+                elseif sty > -EPS then
+                    sty = -EPS
+                end
+                fx = fx / stx
+                fy = fy / sty
+
+                vx = fx * fca - fy * fsa
+                vy = fx * fsa + fy * fca
+                return vx + cx, vy + cy
+            end
+
+            -- Built once per worker. w (falloff) is an argument, not a closed-over global.
+            local function channel(px, py, src, samp, ch, orig, weight, etx, ety, erot, esc,
+                                   w, cx, cy, amount, rad, ana, fca, fsa,
+                                   linX, linY, linFall, smear, n, edge, axial)
+                local extraId = etx * etx + ety * ety + erot * erot
+                    + (esc - 1.0) * (esc - 1.0) < 1.0e-20
+                if extraId and weight * weight < 1.0e-20 then
+                    return orig
+                end
+
+                local sc = 1.0 + rad * amount * weight * w
+                sc = sc * (1.0 + amount * (esc - 1.0))
+
+                local lf = 1.0
+                if linFall then
+                    lf = w
+                end
+                local tx = linX * amount * weight * lf + etx * amount
+                local ty = linY * amount * weight * lf + ety * amount
+                local rot = erot * amount
+                local ax = axial * amount * abs(weight)
+
+                local acc = 0.0
+                local denom = n - 1
+                if denom < 1 then
+                    denom = 1
+                end
+
+                for i = 0, n - 1 do
+                    local t = 1.0
+                    if smear and n > 1 then
+                        t = i / denom
+                    end
+                    local sx, sy = inv(px, py, cx, cy, tx, ty, rot, sc, ana, fca, fsa, t)
+                    sampleAt(src, samp, sx, sy, edge)
+                    acc = acc + take(samp, ch)
+                end
+                acc = acc / n
+
+                if ax > 0.01 then
+                    local sx, sy = inv(px, py, cx, cy, tx, ty, rot, sc, ana, fca, fsa, 1.0)
+                    sampleAt(src, samp, sx + ax, sy, edge)
+                    local t1 = take(samp, ch)
+                    sampleAt(src, samp, sx - ax, sy, edge)
+                    local t2 = take(samp, ch)
+                    sampleAt(src, samp, sx, sy + ax, edge)
+                    local t3 = take(samp, ch)
+                    sampleAt(src, samp, sx, sy - ax, edge)
+                    local t4 = take(samp, ch)
+                    acc = (acc + t1 + t2 + t3 + t4) * 0.2
+                end
+
+                return acc
+            end
+
+            GCA_gen = function(px, py, oR, oG, oB, oA,
+                               src, samp,
+                               cx, cy, rRef,
+                               amount, rad, wr, wg, wb,
+                               inner, outer, pwr, aspect, ana, fca, fsa,
+                               linX, linY, linFall,
+                               smear, n, edge, axial,
+                               rtx, rty, rrot, rsc,
+                               gtx, gty, grot, gsc,
+                               btx, bty, brot, bsc,
+                               preserve)
+                local vx0 = px - cx
+                local vy0 = py - cy
+                local fx = vx0 * fca + vy0 * fsa
+                local fy = (-vx0 * fsa + vy0 * fca) * aspect
+                local rn = sqrt(fx * fx + fy * fy) / rRef
+                local u = (rn - inner) / (outer - inner)
+                if u < 0.0 then
+                    u = 0.0
+                elseif u > 1.0 then
+                    u = 1.0
+                end
+                local w = u ^ pwr
+
+                local r = channel(px, py, src, samp, 0, oR, wr, rtx, rty, rrot, rsc,
+                    w, cx, cy, amount, rad, ana, fca, fsa,
+                    linX, linY, linFall, smear, n, edge, axial)
+                local g = channel(px, py, src, samp, 1, oG, wg, gtx, gty, grot, gsc,
+                    w, cx, cy, amount, rad, ana, fca, fsa,
+                    linX, linY, linFall, smear, n, edge, axial)
+                local b = channel(px, py, src, samp, 2, oB, wb, btx, bty, brot, bsc,
+                    w, cx, cy, amount, rad, ana, fca, fsa,
+                    linX, linY, linFall, smear, n, edge, axial)
+
+                if preserve > 1.0e-6 then
+                    local y0 = YR * oR + YG * oG + YB * oB
+                    local y1 = YR * r + YG * g + YB * b
+                    if y1 * y1 > 1.0e-16 then
+                        local s = 1.0 + preserve * (y0 / y1 - 1.0)
+                        r = r * s
+                        g = g * s
+                        b = b * s
+                    end
+                end
+
+                return r, g, b, oA
+            end
+
+            gen = GCA_gen
+        end
+
+        local r, g, b, a = gen(
+            x + 0.5, y + 0.5, p.R, p.G, p.B, p.A,
+            Src, Samp,
+            Cx, Cy, RRef,
+            Amount, Rad, WR, WG, WB,
+            Inner, Outer, Pwr, Aspect, Ana, FCa, FSa,
+            LinX, LinY, LinFall,
+            Smear, Steps, Edge, Axial,
+            RTx, RTy, RRot, RSc,
+            GTx, GTy, GRot, GSc,
+            BTx, BTy, BRot, BSc,
+            Preserve
+        )
+        p.R = r
+        p.G = g
+        p.B = b
+        p.A = a
+        return p
+    end
+
+    local userData = {
+        Src = img,
+        Cx = cx,
+        Cy = cy,
+        RRef = rRef,
+        Amount = amount,
+        Rad = rad,
+        WR = wR,
+        WG = wG,
+        WB = wB,
+        Inner = inner,
+        Outer = outer,
+        Pwr = power,
+        Aspect = aspect,
+        Ana = ana,
+        FCa = fca,
+        FSa = fsa,
+        LinX = linX,
+        LinY = linY,
+        LinFall = linFall,
+        Smear = smear,
+        Steps = steps,
+        Edge = edge,
+        Axial = axial,
+        RTx = rtx,
+        RTy = rty,
+        RRot = rRot,
+        RSc = rSc,
+        GTx = gtx,
+        GTy = gty,
+        GRot = gRot,
+        GSc = gSc,
+        BTx = btx,
+        BTy = bty,
+        BRot = bRot,
+        BSc = bSc,
+        Preserve = preserve,
+    }
+
+    out:MultiProcessPixels(
+        function()
+            Samp = Pixel()
+        end,
+        userData,
+        DWleft, DWbottom, DWwidth, DWheight,
+        img,
+        processPixel
+    )
+
+    OutImage:Set(req, out)
+end
