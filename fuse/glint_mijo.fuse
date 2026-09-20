@@ -1,0 +1,808 @@
+-- Glint mijo
+-- run in CPU
+--
+-- Nuke Glint：高光沿 N 個等分角度做離散位移拷貝，組成星狀 streak。
+-- 額外功能（現成工具沒有的）：獨立 Weight 輸入用 Z / Red / Luma 控制
+-- 每個光源自己的 ray 長度（近／遠各一組倍率）。
+--
+-- 演算法（gather）：
+--   每個輸出 pixel，沿每條 ray 往回走，取樣來源高光。
+--   亮度 > Tolerance 才算光源。顏色從可選的 Color／plate 輸入取樣
+--   （斷線則用 Input）；Gamma 打在亮度上、色相保持 plate，再乘
+--   lerp(From, To, dist / length_of_that_source)。
+--   Stepped：固定 steps 格，Nuke 那種看得見的拷貝。
+--   Smooth ：約 1 sample / pixel，連續 streak。
+--   Max    ：各 sample 逐通道取亮（Nuke 預設，Smooth 也建議開著）。
+--            關掉則相加：Stepped 是 Nuke 的拷貝疊加；Smooth 會較亮。
+--
+-- Weight：
+--   斷線 = 全圖同一 Length（純 Nuke Glint）。
+--   接上 = remap(channel, Z Near..Far) → lerp(Near Length, Far Length)，
+--   乘在該光源的 Length 上。Near>Far = 近長遠短；Far>Near = 近短遠長。
+--
+-- Color：
+--   斷線 = ray 顏色來自 Input（跟亮度同一張）。
+--   接上 = Input 只負責誰發光，RGB 從 Color／plate 同一顆像素取樣。
+--   典型接法：Input = 抽過的高光，Color = 原 plate（避免高光 clip 成白）。
+--
+-- 與 Nuke 的差異（刻意的）：
+--   1. Length 仍是 pixel，但正角度 = 逆時針（Fusion 慣例）。
+--   2. Mask / Mix 用 Fusion 內建的 Effect Mask 與 Blend。
+--   3. 沒有 occlusion（第一版不做）。
+--   4. 亮度門檻用 max(R,G,B)，飽和色高光不會因為 luma 偏低被砍掉。
+--
+-- MultiProcessPixels 規則與 godrays_mijo.fuse 相同：
+--   processPixel 只看得到 userData 的 key。helper 惰性建到 worker 全域
+--   （GLT_gen）；長存 closure 絕不讀全域，會變的值一律當參數傳入。
+--   threadinitfunc 幫每個 worker 配 Pixel，給 SamplePixelB 用。
+
+FuRegisterClass("Glint_mijo", CT_Tool, {
+    REGS_Name = "Glint mijo",
+    REGS_Category = "mijo",
+    REGS_OpIconString = "GLt",
+    REGS_OpDescription = "Nuke-style star glint with per-source length from a Weight / Z input",
+    REG_NoObjMatCtrls = true,
+    REG_NoMotionBlurCtrls = true,
+    REG_SupportsDoD = true,
+})
+
+function Create()
+    InImage = self:AddInput("Input", "Input", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    InWeight = self:AddInput("Weight", "Weight", {
+        LINKID_DataType = "Image",
+        LINK_Main = 2,
+        INP_Required = false,
+        INPS_StatusText =
+        "Optional. Z / Red / Luma at each highlight scales that highlight's ray length. Unconnected = uniform Length.",
+    })
+
+    InColor = self:AddInput("Color", "Color", {
+        LINKID_DataType = "Image",
+        LINK_Main = 3,
+        INP_Required = false,
+        INPS_StatusText =
+        "Optional plate. Rays take RGB from here; Input only decides which pixels emit. Unconnected = color from Input.",
+    })
+
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    InRays = self:AddInput("No. of Rays", "Rays", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Integer = true,
+        INP_MinScale = 1.0,
+        INP_MaxScale = 16.0,
+        INP_Default = 2.0,
+        INPS_StatusText = "Star points. 2 = anamorphic streak, 4 = cross, 6 / 8 = filter burst.",
+    })
+
+    InLength = self:AddInput("Length", "Length", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 200.0,
+        INP_Default = 50.0,
+        INPS_StatusText = "Master ray length in pixels, before Weight / Odd / Aspect.",
+    })
+
+    InAspect = self:AddInput("Aspect", "Aspect", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.25,
+        INP_MaxScale = 4.0,
+        INP_Default = 1.0,
+        INPS_StatusText = "Star ellipse. >1 stretches horizontally (anamorphic). <1 is taller.",
+    })
+
+    InOddLen = self:AddInput("Odd Ray Length", "OddLength", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 2.0,
+        INP_Default = 1.0,
+        INPS_StatusText = "Length multiplier for every other ray (index 1, 3, 5, …). 1 = all equal.",
+    })
+
+    InRotation = self:AddInput("Rotation", "Rotation", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_MinScale = -360.0,
+        INP_MaxScale = 360.0,
+        INP_Default = 0.0,
+        INPS_StatusText = "Degrees. Positive = counter-clockwise (Fusion). Nuke Glint is the opposite sign.",
+    })
+
+    InMode = self:AddInput("Mode", "Mode", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "MultiButtonControl",
+        INP_Integer = true,
+        INP_Default = 0.0,
+        INP_DoNotifyChanged = true,
+        MBTNC_StretchToFit = true,
+        { MBTNC_AddButton = "Stepped", MBTNCD_ButtonWidth = 0.5 },
+        { MBTNC_AddButton = "Smooth",  MBTNCD_ButtonWidth = 0.5 },
+        INPS_StatusText = "Stepped: Nuke discrete copies. Smooth: ~1 sample per pixel along the ray.",
+    })
+
+    InSteps = self:AddInput("Steps", "Steps", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Integer = true,
+        INP_MinScale = 1.0,
+        INP_MaxScale = 128.0,
+        INP_MaxAllowed = 256.0,
+        INP_Default = 5.0,
+        INPS_StatusText = "Copies per ray in Stepped mode. More = smoother ghosts. Hard cap 256.",
+    })
+
+    InTolerance = self:AddInput("Tolerance", "Tolerance", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        INP_Default = 0.5,
+        INPS_StatusText = "Only pixels with max(R,G,B) above this emit glint. Higher = fewer stars.",
+    })
+
+    InGamma = self:AddInput("Gamma", "Gamma", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.1,
+        INP_MaxScale = 4.0,
+        INP_Default = 1.0,
+        INPS_StatusText =
+        "pow(brightness, Gamma) before the rays. Hue stays the sampled plate color. >1 keeps only the hottest cores.",
+    })
+
+    InFrom_R = self:AddInput("Red", "FromRed", {
+        ICS_Name = "From Color",
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        CLRC_ShowWheel = false,
+        INP_Default = 1.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        ICD_Center = 1.0,
+        IC_ControlGroup = 1,
+        IC_ControlID = 0,
+        INPS_StatusText = "Tint multiplier at the base of each ray. White keeps the sampled plate color.",
+    })
+    InFrom_G = self:AddInput("Green", "FromGreen", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        INP_Default = 1.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        ICD_Center = 1.0,
+        IC_ControlGroup = 1,
+        IC_ControlID = 1,
+    })
+    InFrom_B = self:AddInput("Blue", "FromBlue", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        INP_Default = 1.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        ICD_Center = 1.0,
+        IC_ControlGroup = 1,
+        IC_ControlID = 2,
+    })
+
+    InTo_R = self:AddInput("Red", "ToRed", {
+        ICS_Name = "To Color",
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        CLRC_ShowWheel = false,
+        INP_Default = 0.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        ICD_Center = 1.0,
+        IC_ControlGroup = 2,
+        IC_ControlID = 0,
+        INPS_StatusText = "Tint multiplier at the ray tip. Default black = fade out, hue still from the plate.",
+    })
+    InTo_G = self:AddInput("Green", "ToGreen", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        INP_Default = 0.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        ICD_Center = 1.0,
+        IC_ControlGroup = 2,
+        IC_ControlID = 1,
+    })
+    InTo_B = self:AddInput("Blue", "ToBlue", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        INP_Default = 0.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        ICD_Center = 1.0,
+        IC_ControlGroup = 2,
+        IC_ControlID = 2,
+    })
+
+    InMax = self:AddInput("Max", "Max", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 1.0,
+        INPS_StatusText =
+        "On: keep the brightest sample per channel (Nuke default; use this with Smooth). Off: add the copies.",
+    })
+
+    InEffectOnly = self:AddInput("Effect Only", "EffectOnly", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 0.0,
+        INPS_StatusText = "On: rays only (plus the highlight core). Off: add rays on top of the input.",
+    })
+
+    -- ------------------------------------------------------------------
+    -- Per-source length from Weight / Z
+    -- ------------------------------------------------------------------
+    self:BeginControlNest("Weight Length", "WeightNest", true)
+
+    InWChan = self:AddInput("Weight Channel", "WeightChannel", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 0.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 2.0,
+        { CCS_AddString = "Red" },
+        { CCS_AddString = "Luma" },
+        { CCS_AddString = "Z" },
+        INPS_StatusText =
+        "Which channel on Weight drives length. Red for a grayscale / RGB depth pass; Z for a Fusion 3D Z channel.",
+    })
+
+    InZNear = self:AddInput("Z Near", "ZNear", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "RangeControl",
+        INP_Default = 0.0,
+        IC_ControlGroup = 3,
+        IC_ControlID = 0,
+        RNGCS_LowName = "Near",
+        RNGCS_HighName = "Far",
+        INPS_StatusText = "Weight remap. 0–1 for a normalised depth pass; set to camera Z for a real Z channel.",
+    })
+    InZFar = self:AddInput("Z Far", "ZFar", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "RangeControl",
+        INP_Default = 1.0,
+        IC_ControlGroup = 3,
+        IC_ControlID = 1,
+    })
+
+    InNearLen = self:AddInput("Near Length", "NearLength", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        INP_Default = 1.0,
+        INPS_StatusText = "Length multiplier at Z Near. 2 = twice as long as Length. 0 = no glint on near sources.",
+    })
+
+    InFarLen = self:AddInput("Far Length", "FarLength", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        INP_Default = 1.0,
+        INPS_StatusText = "Length multiplier at Z Far. Near=2 / Far=0.2 = hero lights long, distant twinkles short.",
+    })
+
+    self:EndControlNest()
+end
+
+function NotifyChanged(inp, param, time)
+    if inp == InMode and param and type(param.Value) == "number" then
+        InSteps:SetAttrs({ IC_Visible = param.Value < 0.5 })
+    end
+end
+
+-- IMG_DataWindow / IMG_ValidWindow 只接受 FuRectInt。fuse sandbox 沒有
+-- FuRectInt() 建構子，所以只用 Image / Request 已經給的 rect：
+--   img.DataWindow、GetInputDoD():Intersect()、GetRoI().ValidWindow。
+-- GetRoI() 本身是 ImageDomain，不能直接丟進 Image{}。
+local function outputWindows(req, img)
+    local datawnd = img.DataWindow
+    local dod = req:GetInputDoD(InImage)
+    if dod then
+        datawnd = dod:Intersect(datawnd)
+    end
+
+    local roi = req:GetRoI()
+    local validwnd = nil
+    if roi then
+        datawnd = roi:Intersect(datawnd)
+        validwnd = roi.ValidWindow
+    end
+    return datawnd, validwnd
+end
+
+function PrecalcProcess(req)
+    local img = InImage:GetValue(req)
+    if not img then
+        return
+    end
+
+    local datawnd = outputWindows(req, img)
+    local out = Image({
+        IMG_Like = img,
+        IMG_NoData = true,
+        IMG_DataWindow = datawnd,
+        IMG_Depth = IMG_Depth_Float,
+    })
+    if not out then
+        return
+    end
+    OutImage:Set(req, out)
+end
+
+function Process(req)
+    local img = InImage:GetValue(req)
+    if not img then
+        return
+    end
+
+    local wimg = InWeight:GetValue(req)
+    local cimg = InColor:GetValue(req)
+    local nRays = InRays:GetValue(req).Value
+    local length = InLength:GetValue(req).Value
+    local aspect = InAspect:GetValue(req).Value
+    local oddlen = InOddLen:GetValue(req).Value
+    local rotate = InRotation:GetValue(req).Value
+    local mode = InMode:GetValue(req).Value
+    local steps = InSteps:GetValue(req).Value
+    local tolerance = InTolerance:GetValue(req).Value
+    local gamma = InGamma:GetValue(req).Value
+    local fromR = InFrom_R:GetValue(req).Value
+    local fromG = InFrom_G:GetValue(req).Value
+    local fromB = InFrom_B:GetValue(req).Value
+    local toR = InTo_R:GetValue(req).Value
+    local toG = InTo_G:GetValue(req).Value
+    local toB = InTo_B:GetValue(req).Value
+    local useMax = InMax:GetValue(req).Value > 0.5
+    local effectOnly = InEffectOnly:GetValue(req).Value > 0.5
+    local wChan = InWChan:GetValue(req).Value
+    local zNear = InZNear:GetValue(req).Value
+    local zFar = InZFar:GetValue(req).Value
+    local nearLen = InNearLen:GetValue(req).Value
+    local farLen = InFarLen:GetValue(req).Value
+
+    if nRays < 1 then
+        nRays = 1
+    elseif nRays > 16 then
+        nRays = 16
+    end
+    nRays = nRays - nRays % 1
+
+    if steps < 1 then
+        steps = 1
+    elseif steps > 256 then
+        steps = 256
+    end
+    steps = steps - steps % 1
+
+    if aspect < 0.01 then
+        aspect = 0.01
+    end
+    if oddlen < 0.0 then
+        oddlen = 0.0
+    end
+    if length < 0.0 then
+        length = 0.0
+    end
+    if gamma < 0.01 then
+        gamma = 0.01
+    end
+    if nearLen < 0.0 then
+        nearLen = 0.0
+    end
+    if farLen < 0.0 then
+        farLen = 0.0
+    end
+
+    local smooth = mode > 0.5
+    local hasW = (wimg ~= nil)
+    local maxWMul = 1.0
+    if hasW then
+        if nearLen > farLen then
+            maxWMul = nearLen
+        else
+            maxWMul = farLen
+        end
+        if maxWMul < 0.0 then
+            maxWMul = 0.0
+        end
+    end
+
+    local wScaleX, wScaleY = 1.0, 1.0
+    if hasW then
+        if img.Width > 0 then
+            wScaleX = wimg.Width / img.Width
+        end
+        if img.Height > 0 then
+            wScaleY = wimg.Height / img.Height
+        end
+    end
+
+    local hasC = (cimg ~= nil)
+    local cScaleX, cScaleY = 1.0, 1.0
+    if hasC then
+        if img.Width > 0 then
+            cScaleX = cimg.Width / img.Width
+        end
+        if img.Height > 0 then
+            cScaleY = cimg.Height / img.Height
+        end
+    end
+
+    local datawnd, validwnd = outputWindows(req, img)
+
+    local DWleft = datawnd.left
+    local DWbottom = datawnd.bottom
+    local DWwidth = datawnd.right - DWleft
+    local DWheight = datawnd.top - DWbottom
+
+    if DWwidth <= 0 or DWheight <= 0 then
+        local out = Image({
+            IMG_Like = img,
+            IMG_NoData = true,
+            IMG_DataWindow = datawnd,
+            IMG_Depth = IMG_Depth_Float,
+        })
+        if out then
+            OutImage:Set(req, out)
+        end
+        return
+    end
+
+    -- No visible rays: copy (or black if effect-only).
+    -- mag = sqrt((cos*aspect)^2 + sin^2) peaks at max(aspect, 1).
+    local oddMag = 1.0
+    if oddlen > oddMag then
+        oddMag = oddlen
+    end
+    local stretch = aspect
+    if stretch < 1.0 then
+        stretch = 1.0
+    end
+    local maxWalk = length * oddMag * stretch * maxWMul
+    if maxWalk < 0.5 then
+        if effectOnly then
+            local out = Image({
+                IMG_Like = img,
+                IMG_DataWindow = datawnd,
+                IMG_ValidWindow = validwnd,
+                IMG_Depth = IMG_Depth_Float,
+            })
+            if not out then
+                return
+            end
+            out:Fill(Pixel({ R = 0.0, G = 0.0, B = 0.0, A = 0.0 }))
+            OutImage:Set(req, out)
+            return
+        end
+
+        local out = Image({
+            IMG_Like = img,
+            IMG_DataWindow = datawnd,
+            IMG_ValidWindow = validwnd,
+            IMG_Depth = IMG_Depth_Float,
+            IMG_CopyChannels = true,
+        })
+        if not out then
+            return
+        end
+        img:Crop(out, {})
+        OutImage:Set(req, out)
+        return
+    end
+
+    local out = Image({
+        IMG_Like = img,
+        IMG_DataWindow = datawnd,
+        IMG_ValidWindow = validwnd,
+        IMG_Depth = IMG_Depth_Float,
+        IMG_NoData = true,
+    })
+    if not out then
+        return
+    end
+
+    -- ------------------------------------------------------------------------
+    -- Pixel function
+    --
+    -- MultiProcessPixels 在 worker context 執行：模組層的函式與 Process 的 local
+    -- 都看不到，只有 userData 的 key（加上 threadinitfunc 寫進環境的 Samp /
+    -- Wsamp / Csamp）會被注入成全域。GLT_gen 建到 worker 全域，之後的 pixel 直接重用。
+    -- ------------------------------------------------------------------------
+    local function processPixel(x, y, p)
+        local gen = GLT_gen
+
+        if not gen then
+            local sin = math.sin
+            local cos = math.cos
+            local sqrt = math.sqrt
+            local DEG2RAD = 3.14159265358979323846 / 180.0
+            local SCALE_EPS = 1.0e-6
+            local SMOOTH_CAP = 256
+            local LUMA_R, LUMA_G, LUMA_B = 0.2126, 0.7152, 0.0722
+
+            -- 建一次、跟 worker 活一樣久。絕不讀 userData 全域。
+            local function brightOf(r, gch, b)
+                local v = r
+                if gch > v then v = gch end
+                if b > v then v = b end
+                return v
+            end
+
+            local function tintSample(sr, sg, sb, t, gam, useGamma, fr, fg, fb, tr, tg, tb)
+                if sr < 0.0 then sr = 0.0 end
+                if sg < 0.0 then sg = 0.0 end
+                if sb < 0.0 then sb = 0.0 end
+                -- Gamma on brightness only so plate hue does not shift.
+                local b = sr
+                if sg > b then b = sg end
+                if sb > b then b = sb end
+                if b > SCALE_EPS then
+                    sr, sg, sb = sr / b, sg / b, sb / b
+                    if useGamma then
+                        b = b ^ gam
+                    end
+                    sr, sg, sb = sr * b, sg * b, sb * b
+                else
+                    sr, sg, sb = 0.0, 0.0, 0.0
+                end
+                return sr * (fr + t * (tr - fr)),
+                    sg * (fg + t * (tg - fg)),
+                    sb * (fb + t * (tb - fb))
+            end
+
+            local function plateColor(hasC, csrc, csamp, sx, sy, cScaleX, cScaleY, ir, ig, ib)
+                if hasC > 0.5 then
+                    csrc:SamplePixelB(sx * cScaleX, sy * cScaleY, csamp)
+                    return csamp.R, csamp.G, csamp.B
+                end
+                return ir, ig, ib
+            end
+
+            local function weightMul(hasW, wsrc, wsamp, sx, sy, wScaleX, wScaleY,
+                                     wChan, zNear, zFar, nearLen, farLen)
+                if hasW < 0.5 then
+                    return 1.0
+                end
+                wsrc:SamplePixelB(sx * wScaleX, sy * wScaleY, wsamp)
+                local w
+                if wChan < 0.5 then
+                    w = wsamp.R
+                elseif wChan < 1.5 then
+                    w = LUMA_R * wsamp.R + LUMA_G * wsamp.G + LUMA_B * wsamp.B
+                else
+                    w = wsamp.Z
+                end
+                local span = zFar - zNear
+                local t = 0.0
+                if span > SCALE_EPS or span < -SCALE_EPS then
+                    t = (w - zNear) / span
+                    if t < 0.0 then
+                        t = 0.0
+                    elseif t > 1.0 then
+                        t = 1.0
+                    end
+                end
+                local m = nearLen + t * (farLen - nearLen)
+                if m < 0.0 then
+                    m = 0.0
+                end
+                return m
+            end
+
+            -- 會變動的值一律走參數，不讀全域 —— 這個 closure 會活過多次
+            -- Process 呼叫，讀全域有機會綁到過期的環境表。
+            GLT_gen = function(px, py, src, samp, wsrc, wsamp, hasW,
+                               csrc, csamp, hasC, cScaleX, cScaleY,
+                               nRays, length, aspect, oddlen, rotDeg,
+                               nSteps, smooth, doMax, effectOnly,
+                               tol, gam, maxWMul,
+                               zNear, zFar, nearLen, farLen, wChan,
+                               fr, fg, fb, tr, tg, tb,
+                               wScaleX, wScaleY,
+                               srcR, srcG, srcB, srcA)
+                local useMax = doMax > 0.5
+                local accR, accG, accB
+                if useMax then
+                    accR, accG, accB = -1.0e37, -1.0e37, -1.0e37
+                else
+                    accR, accG, accB = 0.0, 0.0, 0.0
+                end
+                local accN = 0
+
+                if gam < 0.01 then
+                    gam = 0.01
+                end
+                local useGamma = (gam > 1.000001 or gam < 0.999999)
+
+                -- Effect-only needs a core or the star is a hollow ring.
+                if effectOnly > 0.5 then
+                    if brightOf(srcR, srcG, srcB) > tol then
+                        local cr, cg, cb = plateColor(hasC, csrc, csamp, px, py, cScaleX, cScaleY,
+                            srcR, srcG, srcB)
+                        local sr, sg, sb = tintSample(cr, cg, cb, 0.0, gam, useGamma,
+                            fr, fg, fb, tr, tg, tb)
+                        if useMax then
+                            if sr > accR then accR = sr end
+                            if sg > accG then accG = sg end
+                            if sb > accB then accB = sb end
+                        else
+                            accR = accR + sr
+                            accG = accG + sg
+                            accB = accB + sb
+                        end
+                        accN = accN + 1
+                    end
+                end
+
+                if maxWMul >= SCALE_EPS then
+                    local slice = 360.0 / nRays
+                    local isSmooth = smooth > 0.5
+                    for i = 0, nRays - 1 do
+                        local ang = (rotDeg + i * slice) * DEG2RAD
+                        local dx = cos(ang) * aspect
+                        local dy = sin(ang)
+                        local mag = sqrt(dx * dx + dy * dy)
+                        if mag < SCALE_EPS then
+                            mag = SCALE_EPS
+                        end
+                        local ux = dx / mag
+                        local uy = dy / mag
+                        local oddMul = 1.0
+                        if i % 2 == 1 then
+                            oddMul = oddlen
+                        end
+                        local walkLen = length * oddMul * mag * maxWMul
+                        if walkLen >= 0.5 then
+                            local n = nSteps
+                            if isSmooth then
+                                n = walkLen - walkLen % 1
+                                if walkLen > n then
+                                    n = n + 1
+                                end
+                                if n < 1 then
+                                    n = 1
+                                elseif n > SMOOTH_CAP then
+                                    n = SMOOTH_CAP
+                                end
+                            end
+
+                            for s = 1, n do
+                                local dist = (s / n) * walkLen
+                                local sx = px - dist * ux
+                                local sy = py - dist * uy
+                                src:SamplePixelB(sx, sy, samp)
+                                if brightOf(samp.R, samp.G, samp.B) > tol then
+                                    local actualL = walkLen * (
+                                        weightMul(hasW, wsrc, wsamp, sx, sy, wScaleX, wScaleY,
+                                            wChan, zNear, zFar, nearLen, farLen) / maxWMul
+                                    )
+                                    if dist <= actualL + 0.5 then
+                                        local colorT = 1.0
+                                        if actualL > SCALE_EPS then
+                                            colorT = dist / actualL
+                                            if colorT > 1.0 then
+                                                colorT = 1.0
+                                            end
+                                        end
+                                        local cr, cg, cb = plateColor(hasC, csrc, csamp, sx, sy,
+                                            cScaleX, cScaleY, samp.R, samp.G, samp.B)
+                                        local sr, sg, sb = tintSample(cr, cg, cb, colorT,
+                                            gam, useGamma, fr, fg, fb, tr, tg, tb)
+                                        if useMax then
+                                            if sr > accR then accR = sr end
+                                            if sg > accG then accG = sg end
+                                            if sb > accB then accB = sb end
+                                        else
+                                            accR = accR + sr
+                                            accG = accG + sg
+                                            accB = accB + sb
+                                        end
+                                        accN = accN + 1
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if useMax and accN == 0 then
+                    accR, accG, accB = 0.0, 0.0, 0.0
+                end
+
+                if effectOnly > 0.5 then
+                    return accR, accG, accB, srcA
+                end
+                return srcR + accR, srcG + accG, srcB + accB, srcA
+            end
+
+            gen = GLT_gen
+        end
+
+        local r, g, b, a = gen(
+            x + 0.5, y + 0.5,
+            Src, Samp, Wsrc, Wsamp, HasW,
+            Csrc, Csamp, HasC, CScaleX, CScaleY,
+            NRays, Length, Aspect, OddLen, Rot,
+            Steps, Smooth, UseMax, EffectOnly,
+            Tol, Gamma, MaxWMul,
+            ZNear, ZFar, NearLen, FarLen, WChan,
+            FromR, FromG, FromB, ToR, ToG, ToB,
+            WScaleX, WScaleY,
+            p.R, p.G, p.B, p.A
+        )
+        p.R = r
+        p.G = g
+        p.B = b
+        p.A = a
+        return p
+    end
+
+    local userData = {
+        Src = img,
+        Wsrc = wimg or img,
+        HasW = hasW and 1.0 or 0.0,
+        Csrc = cimg or img,
+        HasC = hasC and 1.0 or 0.0,
+        CScaleX = cScaleX,
+        CScaleY = cScaleY,
+        NRays = nRays,
+        Length = length,
+        Aspect = aspect,
+        OddLen = oddlen,
+        Rot = rotate,
+        Steps = steps,
+        Smooth = smooth and 1.0 or 0.0,
+        UseMax = useMax and 1.0 or 0.0,
+        EffectOnly = effectOnly and 1.0 or 0.0,
+        Tol = tolerance,
+        Gamma = gamma,
+        MaxWMul = maxWMul,
+        ZNear = zNear,
+        ZFar = zFar,
+        NearLen = nearLen,
+        FarLen = farLen,
+        WChan = wChan,
+        FromR = fromR,
+        FromG = fromG,
+        FromB = fromB,
+        ToR = toR,
+        ToG = toG,
+        ToB = toB,
+        WScaleX = wScaleX,
+        WScaleY = wScaleY,
+    }
+
+    out:MultiProcessPixels(
+        function()
+            Samp = Pixel()
+            Wsamp = Pixel()
+            Csamp = Pixel()
+        end,
+        userData,
+        DWleft, DWbottom, DWwidth, DWheight,
+        img,
+        processPixel
+    )
+
+    OutImage:Set(req, out)
+end
