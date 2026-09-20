@@ -143,7 +143,7 @@ function Create()
         INP_Integer = true,
         INP_MinScale = 1.0,
         INP_MaxScale = 128.0,
-        INP_MaxAllowed = 256.0,
+        INP_MaxAllowed = 1024.0,
         INP_Default = 5.0,
         INPS_StatusText = "Copies per ray in Stepped mode. More = smoother ghosts. Hard cap 256.",
     })
@@ -447,8 +447,8 @@ function Process(req)
 
     if steps < 1 then
         steps = 1
-    elseif steps > 256 then
-        steps = 256
+    elseif steps > 1024 then
+        steps = 1024
     end
     steps = steps - steps % 1
 
