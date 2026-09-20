@@ -15,6 +15,11 @@
 --   Max    ：各 sample 逐通道取亮（Nuke 預設，Smooth 也建議開著）。
 --            關掉則相加：Stepped 是 Nuke 的拷貝疊加；Smooth 會較亮。
 --   Normalize Steps：Add 模式把每條 ray 除以 sample 數，Steps 拉高亮度不變。
+--   AA / Ray Width / Soft：
+--     小高光斷成虛線，是 gather 只打中 1px 寬的幾何線 + 硬門檻吃掉 bilinear。
+--     Dest SSAA（2x2 / 4x4）對每個輸出 pixel 平均子像素。
+--     Ray Width 沿垂直方向做 tent 覆蓋，線變有厚度。
+--     Soft 讓低於 Tolerance 一點的 bilinear 邊緣仍能貢獻。
 --
 -- Weight：
 --   斷線 = 全圖同一 Length（純 Nuke Glint）。
@@ -142,6 +147,43 @@ function Create()
         INP_Default = 5.0,
         INPS_StatusText = "Copies per ray in Stepped mode. More = smoother ghosts. Hard cap 256.",
     })
+
+    self:BeginControlNest("Quality (AA)", "QualityNest", true)
+
+    InAA = self:AddInput("AA", "AA", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "MultiButtonControl",
+        INP_Integer = true,
+        INP_Default = 1.0,
+        MBTNC_StretchToFit = true,
+        { MBTNC_AddButton = "Off", MBTNCD_ButtonWidth = 0.34 },
+        { MBTNC_AddButton = "2x2", MBTNCD_ButtonWidth = 0.33 },
+        { MBTNC_AddButton = "4x4", MBTNCD_ButtonWidth = 0.33 },
+        INPS_StatusText =
+        "Supersample each output pixel. 2x2 is the default for 1px lights. 4x4 is slower, cleaner diagonals.",
+    })
+
+    InRayWidth = self:AddInput("Ray Width", "RayWidth", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.5,
+        INP_MaxScale = 4.0,
+        INP_Default = 1.25,
+        INPS_StatusText =
+        "Coverage width in pixels, perpendicular to each ray. 0.5 = a 1px aliased line. 1.25 catches small highlights.",
+    })
+
+    InSoft = self:AddInput("Soft", "Soft", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.0,
+        INP_MaxScale = 1.0,
+        INP_Default = 0.2,
+        INPS_StatusText =
+        "Threshold softness. Lets bilinear edges below Tolerance still emit, so 1px sources are not eaten.",
+    })
+
+    self:EndControlNest()
 
     InTolerance = self:AddInput("Tolerance", "Tolerance", {
         LINKID_DataType = "Number",
@@ -387,6 +429,9 @@ function Process(req)
     local useMax = InMax:GetValue(req).Value > 0.5
     local normSteps = InNormSteps:GetValue(req).Value > 0.5
     local effectOnly = InEffectOnly:GetValue(req).Value > 0.5
+    local aaMode = InAA:GetValue(req).Value
+    local rayWidth = InRayWidth:GetValue(req).Value
+    local soft = InSoft:GetValue(req).Value
     local wChan = InWChan:GetValue(req).Value
     local zNear = InZNear:GetValue(req).Value
     local zFar = InZFar:GetValue(req).Value
@@ -425,6 +470,24 @@ function Process(req)
     if farLen < 0.0 then
         farLen = 0.0
     end
+    if rayWidth < 0.5 then
+        rayWidth = 0.5
+    elseif rayWidth > 8.0 then
+        rayWidth = 8.0
+    end
+    if soft < 0.0 then
+        soft = 0.0
+    elseif soft > 2.0 then
+        soft = 2.0
+    end
+
+    local aaSide = 1
+    if aaMode > 1.5 then
+        aaSide = 4
+    elseif aaMode > 0.5 then
+        aaSide = 2
+    end
+    local denseAlong = (aaSide > 1 or rayWidth > 0.51) and 1.0 or 0.0
 
     local smooth = mode > 0.5
     local hasW = (wimg ~= nil)
@@ -622,6 +685,23 @@ function Process(req)
                 return m
             end
 
+            local function emitGate(bright, tol, soft)
+                if soft < SCALE_EPS then
+                    if bright > tol then
+                        return 1.0
+                    end
+                    return 0.0
+                end
+                local lo = tol - soft
+                if bright <= lo then
+                    return 0.0
+                end
+                if bright >= tol then
+                    return 1.0
+                end
+                return (bright - lo) / soft
+            end
+
             -- 會變動的值一律走參數，不讀全域 —— 這個 closure 會活過多次
             -- Process 呼叫，讀全域有機會綁到過期的環境表。
             GLT_gen = function(px, py, src, samp, wsrc, wsamp, hasW,
@@ -632,6 +712,7 @@ function Process(req)
                                zNear, zFar, nearLen, farLen, wChan,
                                fr, fg, fb, tr, tg, tb,
                                wScaleX, wScaleY,
+                               rayWidth, soft, denseAlong,
                                srcR, srcG, srcB, srcA)
                 local useMax = doMax > 0.5
                 local accR, accG, accB
@@ -646,14 +727,46 @@ function Process(req)
                     gam = 0.01
                 end
                 local useGamma = (gam > 1.000001 or gam < 0.999999)
+                local isSmooth = smooth > 0.5
+                local useDense = denseAlong > 0.5
 
-                -- Effect-only needs a core or the star is a hollow ring.
+                local nTaps = 1
+                if rayWidth > 0.51 then
+                    nTaps = 3
+                    if rayWidth > 1.51 then nTaps = 5 end
+                    if rayWidth > 2.51 then nTaps = 7 end
+                    if rayWidth > 3.51 then nTaps = 9 end
+                end
+                local tapSpan = 0.0
+                local tapWSum = 1.0
+                if nTaps > 1 then
+                    tapSpan = (2.0 * rayWidth) / (nTaps - 1)
+                    tapWSum = 0.0
+                    local t = 0
+                    while t < nTaps do
+                        local off = -rayWidth + t * tapSpan
+                        if off < 0.0 then off = -off end
+                        local tw = 1.0 - off / rayWidth
+                        if tw > 0.0 then
+                            tapWSum = tapWSum + tw
+                        end
+                        t = t + 1
+                    end
+                    if tapWSum < SCALE_EPS then
+                        tapWSum = 1.0
+                    end
+                end
+
+                -- Effect-only core. Sample at the dest (subpixel-aware for SSAA).
                 if effectOnly > 0.5 then
-                    if brightOf(srcR, srcG, srcB) > tol then
+                    src:SamplePixelB(px, py, samp)
+                    local gate = emitGate(brightOf(samp.R, samp.G, samp.B), tol, soft)
+                    if gate > 0.0 then
                         local cr, cg, cb = plateColor(hasC, csrc, csamp, px, py, cScaleX, cScaleY,
-                            srcR, srcG, srcB)
+                            samp.R, samp.G, samp.B)
                         local sr, sg, sb = tintSample(cr, cg, cb, 0.0, gam, useGamma,
                             fr, fg, fb, tr, tg, tb)
+                        sr, sg, sb = sr * gate, sg * gate, sb * gate
                         if useMax then
                             if sr > accR then accR = sr end
                             if sg > accG then accG = sg end
@@ -669,7 +782,6 @@ function Process(req)
 
                 if maxWMul >= SCALE_EPS then
                     local slice = 360.0 / nRays
-                    local isSmooth = smooth > 0.5
                     for i = 0, nRays - 1 do
                         local ang = (rotDeg + i * slice) * DEG2RAD
                         local dx = cos(ang) * aspect
@@ -680,6 +792,8 @@ function Process(req)
                         end
                         local ux = dx / mag
                         local uy = dy / mag
+                        local pxp = -uy
+                        local pyp = ux
                         local oddMul = 1.0
                         if i % 2 == 1 then
                             oddMul = oddlen
@@ -687,7 +801,7 @@ function Process(req)
                         local walkLen = length * oddMul * mag * maxWMul
                         if walkLen >= 0.5 then
                             local n = nSteps
-                            if isSmooth then
+                            if isSmooth or useDense then
                                 n = walkLen - walkLen % 1
                                 if walkLen > n then
                                     n = n + 1
@@ -697,45 +811,96 @@ function Process(req)
                                 elseif n > SMOOTH_CAP then
                                     n = SMOOTH_CAP
                                 end
+                                if (not isSmooth) and n < nSteps then
+                                    n = nSteps
+                                end
                             end
 
                             local addScale = 1.0
                             if normSteps > 0.5 and not useMax then
                                 addScale = 1.0 / n
                             end
+                            local spacing = walkLen / nSteps
+                            if spacing < SCALE_EPS then
+                                spacing = SCALE_EPS
+                            end
 
                             for s = 1, n do
                                 local dist = (s / n) * walkLen
-                                local sx = px - dist * ux
-                                local sy = py - dist * uy
-                                src:SamplePixelB(sx, sy, samp)
-                                if brightOf(samp.R, samp.G, samp.B) > tol then
-                                    local actualL = walkLen * (
-                                        weightMul(hasW, wsrc, wsamp, sx, sy, wScaleX, wScaleY,
-                                            wChan, zNear, zFar, nearLen, farLen) / maxWMul
-                                    )
-                                    if dist <= actualL + 0.5 then
-                                        local colorT = 1.0
-                                        if actualL > SCALE_EPS then
-                                            colorT = dist / actualL
-                                            if colorT > 1.0 then
-                                                colorT = 1.0
+                                local stepW = 1.0
+                                if (not isSmooth) and useDense then
+                                    local k = dist / spacing
+                                    local nearest = k - k % 1
+                                    if k - nearest >= 0.5 then
+                                        nearest = nearest + 1
+                                    end
+                                    if nearest < 1 then
+                                        nearest = 1
+                                    elseif nearest > nSteps then
+                                        nearest = nSteps
+                                    end
+                                    local d = dist - nearest * spacing
+                                    if d < 0.0 then d = -d end
+                                    if d >= rayWidth then
+                                        stepW = 0.0
+                                    else
+                                        stepW = 1.0 - d / rayWidth
+                                    end
+                                end
+                                if stepW > 0.0 then
+                                    local sx0 = px - dist * ux
+                                    local sy0 = py - dist * uy
+                                    local t = 0
+                                    while t < nTaps do
+                                        local off = 0.0
+                                        local tw = 1.0
+                                        if nTaps > 1 then
+                                            off = -rayWidth + t * tapSpan
+                                            local aoff = off
+                                            if aoff < 0.0 then aoff = -aoff end
+                                            tw = 1.0 - aoff / rayWidth
+                                            if tw > 0.0 then
+                                                tw = tw / tapWSum
                                             end
                                         end
-                                        local cr, cg, cb = plateColor(hasC, csrc, csamp, sx, sy,
-                                            cScaleX, cScaleY, samp.R, samp.G, samp.B)
-                                        local sr, sg, sb = tintSample(cr, cg, cb, colorT,
-                                            gam, useGamma, fr, fg, fb, tr, tg, tb)
-                                        if useMax then
-                                            if sr > accR then accR = sr end
-                                            if sg > accG then accG = sg end
-                                            if sb > accB then accB = sb end
-                                        else
-                                            accR = accR + sr * addScale
-                                            accG = accG + sg * addScale
-                                            accB = accB + sb * addScale
+                                        if tw > 0.0 then
+                                            local sx = sx0 + pxp * off
+                                            local sy = sy0 + pyp * off
+                                            src:SamplePixelB(sx, sy, samp)
+                                            local gate = emitGate(brightOf(samp.R, samp.G, samp.B), tol, soft)
+                                            if gate > 0.0 then
+                                                local actualL = walkLen * (
+                                                    weightMul(hasW, wsrc, wsamp, sx, sy, wScaleX, wScaleY,
+                                                        wChan, zNear, zFar, nearLen, farLen) / maxWMul
+                                                )
+                                                if dist <= actualL + rayWidth then
+                                                    local colorT = 1.0
+                                                    if actualL > SCALE_EPS then
+                                                        colorT = dist / actualL
+                                                        if colorT > 1.0 then
+                                                            colorT = 1.0
+                                                        end
+                                                    end
+                                                    local cr, cg, cb = plateColor(hasC, csrc, csamp, sx, sy,
+                                                        cScaleX, cScaleY, samp.R, samp.G, samp.B)
+                                                    local sr, sg, sb = tintSample(cr, cg, cb, colorT,
+                                                        gam, useGamma, fr, fg, fb, tr, tg, tb)
+                                                    local w = gate * tw * stepW
+                                                    sr, sg, sb = sr * w, sg * w, sb * w
+                                                    if useMax then
+                                                        if sr > accR then accR = sr end
+                                                        if sg > accG then accG = sg end
+                                                        if sb > accB then accB = sb end
+                                                    else
+                                                        accR = accR + sr * addScale
+                                                        accG = accG + sg * addScale
+                                                        accB = accB + sb * addScale
+                                                    end
+                                                    accN = accN + 1
+                                                end
+                                            end
                                         end
-                                        accN = accN + 1
+                                        t = t + 1
                                     end
                                 end
                             end
@@ -756,18 +921,54 @@ function Process(req)
             gen = GLT_gen
         end
 
-        local r, g, b, a = gen(
-            x + 0.5, y + 0.5,
-            Src, Samp, Wsrc, Wsamp, HasW,
-            Csrc, Csamp, HasC, CScaleX, CScaleY,
-            NRays, Length, Aspect, OddLen, Rot,
-            Steps, Smooth, UseMax, EffectOnly, NormSteps,
-            Tol, Gamma, MaxWMul,
-            ZNear, ZFar, NearLen, FarLen, WChan,
-            FromR, FromG, FromB, ToR, ToG, ToB,
-            WScaleX, WScaleY,
-            p.R, p.G, p.B, p.A
-        )
+        local r, g, b, a
+        if AaSide <= 1 then
+            r, g, b, a = gen(
+                x + 0.5, y + 0.5,
+                Src, Samp, Wsrc, Wsamp, HasW,
+                Csrc, Csamp, HasC, CScaleX, CScaleY,
+                NRays, Length, Aspect, OddLen, Rot,
+                Steps, Smooth, UseMax, EffectOnly, NormSteps,
+                Tol, Gamma, MaxWMul,
+                ZNear, ZFar, NearLen, FarLen, WChan,
+                FromR, FromG, FromB, ToR, ToG, ToB,
+                WScaleX, WScaleY,
+                RayWidth, Soft, DenseAlong,
+                p.R, p.G, p.B, p.A
+            )
+        else
+            local nSide = AaSide
+            local inv = 1.0 / (nSide * nSide)
+            r, g, b, a = 0.0, 0.0, 0.0, 0.0
+            local iy = 0
+            while iy < nSide do
+                local ox_y = (iy + 0.5) / nSide - 0.5
+                local ix = 0
+                while ix < nSide do
+                    local ox_x = (ix + 0.5) / nSide - 0.5
+                    local sr, sg, sb, sa = gen(
+                        x + 0.5 + ox_x, y + 0.5 + ox_y,
+                        Src, Samp, Wsrc, Wsamp, HasW,
+                        Csrc, Csamp, HasC, CScaleX, CScaleY,
+                        NRays, Length, Aspect, OddLen, Rot,
+                        Steps, Smooth, UseMax, EffectOnly, NormSteps,
+                        Tol, Gamma, MaxWMul,
+                        ZNear, ZFar, NearLen, FarLen, WChan,
+                        FromR, FromG, FromB, ToR, ToG, ToB,
+                        WScaleX, WScaleY,
+                        RayWidth, Soft, DenseAlong,
+                        p.R, p.G, p.B, p.A
+                    )
+                    r = r + sr
+                    g = g + sg
+                    b = b + sb
+                    a = a + sa
+                    ix = ix + 1
+                end
+                iy = iy + 1
+            end
+            r, g, b, a = r * inv, g * inv, b * inv, a * inv
+        end
         p.R = r
         p.G = g
         p.B = b
@@ -793,6 +994,10 @@ function Process(req)
         UseMax = useMax and 1.0 or 0.0,
         EffectOnly = effectOnly and 1.0 or 0.0,
         NormSteps = normSteps and 1.0 or 0.0,
+        RayWidth = rayWidth,
+        Soft = soft,
+        DenseAlong = denseAlong,
+        AaSide = aaSide,
         Tol = tolerance,
         Gamma = gamma,
         MaxWMul = maxWMul,
