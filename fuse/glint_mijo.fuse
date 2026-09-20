@@ -14,6 +14,7 @@
 --   Smooth ：約 1 sample / pixel，連續 streak。
 --   Max    ：各 sample 逐通道取亮（Nuke 預設，Smooth 也建議開著）。
 --            關掉則相加：Stepped 是 Nuke 的拷貝疊加；Smooth 會較亮。
+--   Normalize Steps：Add 模式把每條 ray 除以 sample 數，Steps 拉高亮度不變。
 --
 -- Weight：
 --   斷線 = 全圖同一 Length（純 Nuke Glint）。
@@ -234,8 +235,19 @@ function Create()
         INPID_InputControl = "CheckboxControl",
         INP_Integer = true,
         INP_Default = 1.0,
+        ICD_Width = 0.5,
         INPS_StatusText =
         "On: keep the brightest sample per channel (Nuke default; use this with Smooth). Off: add the copies.",
+    })
+
+    InNormSteps = self:AddInput("Normalize Steps", "NormalizeSteps", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 0.0,
+        ICD_Width = 0.5,
+        INPS_StatusText =
+        "Add mode only. Divide each ray by its sample count so raising Steps (or Smooth density) does not get brighter.",
     })
 
     InEffectOnly = self:AddInput("Effect Only", "EffectOnly", {
@@ -373,6 +385,7 @@ function Process(req)
     local toG = InTo_G:GetValue(req).Value
     local toB = InTo_B:GetValue(req).Value
     local useMax = InMax:GetValue(req).Value > 0.5
+    local normSteps = InNormSteps:GetValue(req).Value > 0.5
     local effectOnly = InEffectOnly:GetValue(req).Value > 0.5
     local wChan = InWChan:GetValue(req).Value
     local zNear = InZNear:GetValue(req).Value
@@ -614,7 +627,7 @@ function Process(req)
             GLT_gen = function(px, py, src, samp, wsrc, wsamp, hasW,
                                csrc, csamp, hasC, cScaleX, cScaleY,
                                nRays, length, aspect, oddlen, rotDeg,
-                               nSteps, smooth, doMax, effectOnly,
+                               nSteps, smooth, doMax, effectOnly, normSteps,
                                tol, gam, maxWMul,
                                zNear, zFar, nearLen, farLen, wChan,
                                fr, fg, fb, tr, tg, tb,
@@ -686,6 +699,11 @@ function Process(req)
                                 end
                             end
 
+                            local addScale = 1.0
+                            if normSteps > 0.5 and not useMax then
+                                addScale = 1.0 / n
+                            end
+
                             for s = 1, n do
                                 local dist = (s / n) * walkLen
                                 local sx = px - dist * ux
@@ -713,9 +731,9 @@ function Process(req)
                                             if sg > accG then accG = sg end
                                             if sb > accB then accB = sb end
                                         else
-                                            accR = accR + sr
-                                            accG = accG + sg
-                                            accB = accB + sb
+                                            accR = accR + sr * addScale
+                                            accG = accG + sg * addScale
+                                            accB = accB + sb * addScale
                                         end
                                         accN = accN + 1
                                     end
@@ -743,7 +761,7 @@ function Process(req)
             Src, Samp, Wsrc, Wsamp, HasW,
             Csrc, Csamp, HasC, CScaleX, CScaleY,
             NRays, Length, Aspect, OddLen, Rot,
-            Steps, Smooth, UseMax, EffectOnly,
+            Steps, Smooth, UseMax, EffectOnly, NormSteps,
             Tol, Gamma, MaxWMul,
             ZNear, ZFar, NearLen, FarLen, WChan,
             FromR, FromG, FromB, ToR, ToG, ToB,
@@ -774,6 +792,7 @@ function Process(req)
         Smooth = smooth and 1.0 or 0.0,
         UseMax = useMax and 1.0 or 0.0,
         EffectOnly = effectOnly and 1.0 or 0.0,
+        NormSteps = normSteps and 1.0 or 0.0,
         Tol = tolerance,
         Gamma = gamma,
         MaxWMul = maxWMul,
