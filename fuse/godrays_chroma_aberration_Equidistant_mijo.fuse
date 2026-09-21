@@ -31,13 +31,40 @@
 --     Axial：在 sample dir 的 east/north 上偏 axial/f，再 project。
 --     θ > θ_max 的 sample 跳過，不 Wrap 到圓的另一側。
 --
+-- Colour management：
+--   取樣／平均（Smear、Optical、Axial plus-tap）在曲線的哪一側做，結果不一樣。
+--   Color Space 說的是「這個 comp 在哪個色彩空間」，Process In 說的是「效果實際
+--   在曲線的哪一側運算」。不管哪一邊，plate 進來什麼空間就出去什麼空間，
+--   所以這個工具是 drop-in，前後掛的節點不用改。
+--
+--   Process In = Linear（預設）— 傳統 sRGB workflow：plate 是編碼的，
+--       decode → 在 linear light 取樣 → encode 回去。物理正確。
+--   Process In = Color Space  — 反方向，給 linear workflow 用：plate 已經是
+--       linear（EXR / comp 中段），encode 進曲線 → 在裡面取樣 → decode 回 linear。
+--       要的是舊時代 display-space 那種 smear 長相。
+--   兩邊都是精確可逆，效果沒開時原圖原封不動回來。
+--
+--   sRGB / Rec.709  — 有 transfer curve，需要一次 decode pass（另配一張 float 圖）。
+--   ACEScg / ACES2065-1 — 本來就 linear，不做曲線；提供的是基色。
+--   Working Gamut   — 逐通道分離實際發生的基色空間。進來轉過去、出去轉回來，
+--                     plate 的色域不變。寬基色會把色邊拉更開、Optical 彩虹更飽。
+--                     D65 ↔ ACES D60 走 Bradford CAT。矩陣反矩陣是算出來的，
+--                     所以來回是精確可逆，效果沒開時完全不留痕跡。
+--                     3x3 只在 linear light 上成立，所以 gamut 那一步永遠排在
+--                     曲線的 linear 那一側（Process In 一反，順序就跟著反）。
+--   Process Gamma   — 疊在上面的額外指數，1 = linear 平均。
+--   luma 權重（Preserve Luma / Optical Chroma）取自 working gamut 的公布值。
+--   負值一律走 sign(v) * f(|v|)，ACES 的負光不會變 NaN；Optical Chroma 的負值
+--   夾擠只在「display 基色 + display 曲線」時才做。Alpha 不做轉換。
+--
 -- Alpha 永遠用原像素，不參與 smear。
 -- 預設不 minify：scale < 1 會往畫框外／圓外取樣，Black 會把縮小的通道填成 0，
 -- 畫框變成一整圈純紅／純藍。三通道一起抬到 min(scale)=1，相對色差不變。
 --
 -- MultiProcessPixels 規則與 godrays_mijo.fuse 相同：
 --   processPixel 只看得到 userData 的 key。helper 惰性建到 worker 全域
---   （GCAE_gen2，不跟原版 GCA_gen 搶 worker 全域）；長存 closure 絕不讀全域，
+--   （GCAE_gen3，不跟原版 GCA_gen 搶 worker 全域；簽章改過就換號，避免舊 session
+--   殘留的 GCAE_gen2 被沿用）；長存 closure 絕不讀全域，
 --   會變的值一律當參數傳入。threadinitfunc 幫每個 worker 配一個 Pixel。
 
 FuRegisterClass("GodraysChromaAberration_Equidistant_mijo", CT_Tool, {
@@ -408,6 +435,71 @@ function Create()
         INPS_StatusText = "Re-applies source Rec.709 luma after the split so the plate doesn't darken. 0 = off.",
     })
 
+    -- ------------------------------------------------------------------
+    -- Colour management
+    -- ------------------------------------------------------------------
+    self:BeginControlNest("Color Space", "ColorNest", false)
+
+    InColorSpace = self:AddInput("Color Space", "ColorSpace", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 0.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 4.0,
+        { CCS_AddString = "None (Linear)" },
+        { CCS_AddString = "sRGB" },
+        { CCS_AddString = "Rec.709" },
+        { CCS_AddString = "ACEScg" },
+        { CCS_AddString = "ACES2065-1" },
+        INP_DoNotifyChanged = true,
+        INPS_StatusText =
+        "The comp's colour space. Together with Process In it decides which side of the curve the sampling happens on; either way the plate leaves in the space it arrived in. ACEScg / ACES2065-1 are already linear, so they contribute primaries and luma weights (AP1 / AP0) only.",
+    })
+
+    InProcessIn = self:AddInput("Process In", "ProcessIn", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "MultiButtonControl",
+        INP_Integer = true,
+        INP_Default = 0.0,
+        IC_Visible = false,
+        MBTNC_StretchToFit = true,
+        { MBTNC_AddButton = "Linear",      MBTNCD_ButtonWidth = 0.5 },
+        { MBTNC_AddButton = "Color Space", MBTNCD_ButtonWidth = 0.5 },
+        INPS_StatusText =
+        "Which space the smear actually averages in. Linear (default): the plate arrives encoded, is decoded, sampled in linear light, and re-encoded — the traditional sRGB-plate workflow, and physically correct. Color Space: the plate already arrives linear (EXR / linear workflow), is encoded into the curve, sampled there, and decoded back — use this to put the old display-space smear look on a linear plate. Both are exact round trips.",
+    })
+
+    InWorkGamut = self:AddInput("Working Gamut", "WorkingGamut", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 0.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 5.0,
+        { CCS_AddString = "Same as Color Space" },
+        { CCS_AddString = "Rec.709 / sRGB" },
+        { CCS_AddString = "ACEScg (AP1)" },
+        { CCS_AddString = "ACES2065-1 (AP0)" },
+        { CCS_AddString = "DCI-P3 D65" },
+        { CCS_AddString = "Rec.2020" },
+        INPS_StatusText =
+        "Primaries the per-channel split happens in. Converted in on the way through and back out, so the plate's gamut is unchanged. Wider primaries spread the fringe further apart and saturate the Optical rainbow. Bradford-adapted across the ACES D60 / D65 white points.",
+    })
+
+    InProcGamma = self:AddInput("Process Gamma", "ProcessGamma", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.25,
+        INP_MaxScale = 4.0,
+        INP_Default = 1.0,
+        ICD_Center = 1.0,
+        INPS_StatusText =
+        "Extra exponent on top of Color Space. Smear / Optical average in x^(1/Gamma), the result is raised back. 1 = average in linear light (physical). >1 tames hot cores and widens the visible fringe.",
+    })
+
+    self:EndControlNest()
+
     InEdge = self:AddInput("Edge", "Edge", {
         LINKID_DataType = "Number",
         INPID_InputControl = "ComboControl",
@@ -429,6 +521,10 @@ function NotifyChanged(inp, param, time)
         InOptChroma:SetAttrs({ IC_Visible = param.Value > 1.5 })
     elseif inp == InProjection and param and type(param.Value) == "number" then
         InCircleRadius:SetAttrs({ IC_Visible = param.Value > 0.5 })
+    elseif inp == InColorSpace and param and type(param.Value) == "number" then
+        -- Only sRGB / Rec.709 carry a curve; with the linear spaces there is no
+        -- second side to process on, so the direction toggle would be a no-op.
+        InProcessIn:SetAttrs({ IC_Visible = param.Value > 0.5 and param.Value < 2.5 })
     end
 end
 
@@ -452,6 +548,117 @@ local function outputWindows(req, img)
         validwnd = roi.ValidWindow
     end
     return datawnd, validwnd
+end
+
+-- ----------------------------------------------------------------------------
+-- Gamut tables. RGB → CIE XYZ, row-major. Inverses are computed, never
+-- tabulated, so work→src is an exact inverse of src→work and a round trip
+-- through an unused effect is a no-op.
+--
+-- `luma` (Preserve Luma / Optical Chroma) is each standard's *published* Y
+-- coefficients, not the matrix Y row. They differ in the 4th decimal for
+-- BT.709 / BT.2020, and BT.709's published set is what this fuse used before
+-- colour management existed — keeping it makes the default path bit-identical
+-- to the old behaviour. P3-D65 has no published set, so it is derived.
+-- Main-thread only: worker context never sees these.
+-- ----------------------------------------------------------------------------
+local GAMUT_BT709    = 0
+local GAMUT_AP1      = 1
+local GAMUT_AP0      = 2
+local GAMUT_P3D65    = 3
+local GAMUT_2020     = 4
+
+local GAMUTS         = {
+    [GAMUT_BT709] = {
+        d60 = false,
+        luma = { 0.2126, 0.7152, 0.0722 },
+        m = {
+            0.4123907993, 0.3575843394, 0.1804807884,
+            0.2126390059, 0.7151686788, 0.0721923154,
+            0.0193308187, 0.1191947798, 0.9505321522,
+        }
+    },
+    [GAMUT_AP1] = {
+        d60 = true,
+        luma = { 0.2722287168, 0.6740817658, 0.0536895174 },
+        m = {
+            0.6624541811, 0.1340042065, 0.1561876870,
+            0.2722287168, 0.6740817658, 0.0536895174,
+            -0.0055746495, 0.0040607335, 1.0103391003,
+        }
+    },
+    [GAMUT_AP0] = {
+        d60 = true,
+        luma = { 0.3439664498, 0.7281660966, -0.0721325464 },
+        m = {
+            0.9525523959, 0.0000000000, 0.0000936786,
+            0.3439664498, 0.7281660966, -0.0721325464,
+            0.0000000000, 0.0000000000, 1.0088251844,
+        }
+    },
+    [GAMUT_P3D65] = {
+        d60 = false,
+        luma = { 0.2289745641, 0.6917385218, 0.0792869141 },
+        m = {
+            0.4865709486, 0.2656676932, 0.1982172852,
+            0.2289745641, 0.6917385218, 0.0792869141,
+            0.0000000000, 0.0451133819, 1.0439443689,
+        }
+    },
+    [GAMUT_2020] = {
+        d60 = false,
+        luma = { 0.2627, 0.6780, 0.0593 },
+        m = {
+            0.6369580483, 0.1446169036, 0.1688809752,
+            0.2627002120, 0.6779980715, 0.0593017165,
+            0.0000000000, 0.0280726930, 1.0609850577,
+        }
+    },
+}
+
+-- Bradford CAT between the D65 of BT.709 / P3 / 2020 and the ~D60 of ACES.
+-- Without it a 709 → ACEScg round trip leaves a visible green/magenta cast.
+local CAT_D65_TO_D60 = {
+    1.01303000, 0.00610531, -0.01497100,
+    0.00769823, 0.99816500, -0.00503203,
+    -0.00284131, 0.00468516, 0.92450700,
+}
+local CAT_D60_TO_D65 = {
+    0.98722400, -0.00611327, 0.01595330,
+    -0.00759836, 1.00186000, 0.00533002,
+    0.00307257, -0.00509595, 1.08168000,
+}
+
+local function mat3mul(a, b)
+    local o = {}
+    for r = 0, 2 do
+        for c = 0, 2 do
+            o[r * 3 + c + 1] =
+                a[r * 3 + 1] * b[c + 1] +
+                a[r * 3 + 2] * b[c + 4] +
+                a[r * 3 + 3] * b[c + 7]
+        end
+    end
+    return o
+end
+
+local function mat3inv(m)
+    local a, b, c = m[1], m[2], m[3]
+    local d, e, f = m[4], m[5], m[6]
+    local g, h, i = m[7], m[8], m[9]
+    local A = e * i - f * h
+    local B = f * g - d * i
+    local C = d * h - e * g
+    local det = a * A + b * B + c * C
+    if det * det < 1.0e-24 then
+        return nil
+    end
+    local id = 1.0 / det
+    return {
+        A * id, (c * h - b * i) * id, (b * f - c * e) * id,
+        B * id, (a * i - c * g) * id, (c * d - a * f) * id,
+        C * id, (b * g - a * h) * id, (a * e - b * d) * id,
+    }
 end
 
 function PrecalcProcess(req)
@@ -518,6 +725,10 @@ function Process(req)
     local preserve = InPreserveLuma:GetValue(req).Value
     local edge = InEdge:GetValue(req).Value
     local optChroma = InOptChroma:GetValue(req).Value
+    local colorSpace = InColorSpace:GetValue(req).Value
+    local processIn = InProcessIn:GetValue(req).Value
+    local workGamutSel = InWorkGamut:GetValue(req).Value
+    local procGamma = InProcGamma:GetValue(req).Value
 
     if steps < 1 then
         steps = 1
@@ -549,6 +760,90 @@ function Process(req)
     if optChroma < 0.0 then
         optChroma = 0.0
     end
+
+    -- Color Space splits into two independent things: a transfer curve (only
+    -- sRGB / Rec.709 have one) and a set of primaries. ACEScg / ACES2065-1 are
+    -- scene-linear, so they contribute primaries only and cost nothing extra.
+    colorSpace = colorSpace - colorSpace % 1
+    if colorSpace < 0 then
+        colorSpace = 0
+    elseif colorSpace > 4 then
+        colorSpace = 4
+    end
+    local csTf = 0
+    if colorSpace == 1 or colorSpace == 2 then
+        csTf = colorSpace
+    end
+
+    -- Process In = Color Space reverses the curve: the plate arrives linear and
+    -- the effect runs inside the encoding instead of outside it. Meaningless
+    -- without a curve, so it is forced off for the linear spaces.
+    local invDir = csTf > 0 and processIn > 0.5
+
+    local srcGamut = GAMUT_BT709
+    if colorSpace == 3 then
+        srcGamut = GAMUT_AP1
+    elseif colorSpace == 4 then
+        srcGamut = GAMUT_AP0
+    end
+
+    workGamutSel = workGamutSel - workGamutSel % 1
+    if workGamutSel < 0 then
+        workGamutSel = 0
+    elseif workGamutSel > 5 then
+        workGamutSel = 5
+    end
+    local workGamut = srcGamut
+    if workGamutSel >= 1 then
+        workGamut = workGamutSel - 1
+    end
+
+    -- src → work, and its exact inverse. The Bradford CAT only appears when the
+    -- two gamuts disagree about the white point (ACES D60 vs everything else).
+    local mf, mi
+    if workGamut ~= srcGamut then
+        local gs = GAMUTS[srcGamut]
+        local gw = GAMUTS[workGamut]
+        local toXYZ = gs.m
+        if gs.d60 ~= gw.d60 then
+            if gs.d60 then
+                toXYZ = mat3mul(CAT_D60_TO_D65, toXYZ)
+            else
+                toXYZ = mat3mul(CAT_D65_TO_D60, toXYZ)
+            end
+        end
+        local wInv = mat3inv(gw.m)
+        if wInv then
+            mf = mat3mul(wInv, toXYZ)
+            mi = mat3inv(mf)
+        end
+    end
+    local useMat = mf ~= nil and mi ~= nil
+    if not useMat then
+        mf = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }
+        mi = mf
+    end
+
+    -- Luma weights follow the *working* gamut: that is the space Preserve Luma
+    -- and Optical Chroma actually run in.
+    local wl = GAMUTS[workGamut].luma
+    local yR, yG, yB = wl[1], wl[2], wl[3]
+
+    -- Optical Chroma's negative clamp only makes sense when the result is headed
+    -- for a display curve in display primaries. In scene-linear / wide-gamut work
+    -- negatives are real data (AP0's blue luma weight is itself negative), so
+    -- clipping them there would quietly destroy the plate.
+    local clampNeg = csTf > 0
+        and workGamut ~= GAMUT_AP0
+        and workGamut ~= GAMUT_AP1
+
+    if procGamma < 0.01 then
+        procGamma = 0.01
+    elseif procGamma > 100.0 then
+        procGamma = 100.0
+    end
+    local gamInv = 1.0 / procGamma
+    local needXf = csTf > 0 or procGamma ~= 1.0 or useMat
 
     -- Transform: one sample at t=1. Smear: Steps along 0..1.
     -- Optical: Steps wavelengths at each λ's full transform (not smeared).
@@ -653,14 +948,150 @@ function Process(req)
     end
 
     -- ------------------------------------------------------------------------
+    -- Decode pass: everything downstream samples and averages in the process
+    -- space, so the whole source DoD is converted once here rather than per tap
+    -- (Optical at 24 Steps would otherwise pay 72 pow() per output pixel).
+    -- gen() re-encodes on the way out. A linear space at Gamma = 1 skips the copy.
+    --
+    -- decodePixel is handed to Fusion fresh each run, so reading the userData
+    -- globals is fine; GCAE_dec3 is long-lived and takes everything that can
+    -- change as arguments.
+    -- ------------------------------------------------------------------------
+    local function decodePixel(x, y, p)
+        local dec = GCAE_dec3
+
+        if not dec then
+            -- Odd-symmetric around 0 so ACES negatives survive both ways.
+            -- Rec.709 uses the exact α / β: the spec's rounded 1.099 / 0.099 /
+            -- 0.018 leave a ~2.5e-4 step at the knee, these join.
+            local function curve(v, cs, enc)
+                local s = 1.0
+                if v < 0.0 then
+                    v = -v
+                    s = -1.0
+                end
+                if enc then
+                    if cs == 1 then
+                        if v <= 0.0031308 then
+                            v = v * 12.92
+                        else
+                            v = 1.055 * v ^ (1.0 / 2.4) - 0.055
+                        end
+                    else
+                        if v < 0.01805396851081 then
+                            v = v * 4.5
+                        else
+                            v = 1.09929682680944 * v ^ 0.45 - 0.09929682680944
+                        end
+                    end
+                else
+                    if cs == 1 then
+                        if v <= 0.04045 then
+                            v = v / 12.92
+                        else
+                            v = ((v + 0.055) / 1.055) ^ 2.4
+                        end
+                    else
+                        if v < 0.08124285829863 then
+                            v = v / 4.5
+                        else
+                            v = ((v + 0.09929682680944) / 1.09929682680944) ^ (1.0 / 0.45)
+                        end
+                    end
+                end
+                return s * v
+            end
+
+            local function sp(v, e)
+                if v < 0.0 then
+                    return -((-v) ^ e)
+                end
+                return v ^ e
+            end
+
+            -- Plate → process space. A 3x3 is only meaningful on linear light,
+            -- so the gamut step always sits on the linear side of the curve:
+            --   inv = false  plate is encoded   decode → matrix → gamma
+            --   inv = true   plate is linear    matrix → encode → gamma
+            -- The matrix mixes channels, so it cannot fold into a per-channel call.
+            GCAE_dec3 = function(r, g, b, cs, inv, e, um,
+                                 m11, m12, m13, m21, m22, m23, m31, m32, m33)
+                if cs > 0 and not inv then
+                    r, g, b = curve(r, cs, false), curve(g, cs, false), curve(b, cs, false)
+                end
+                if um then
+                    r, g, b =
+                        m11 * r + m12 * g + m13 * b,
+                        m21 * r + m22 * g + m23 * b,
+                        m31 * r + m32 * g + m33 * b
+                end
+                if cs > 0 and inv then
+                    r, g, b = curve(r, cs, true), curve(g, cs, true), curve(b, cs, true)
+                end
+                if e ~= 1.0 then
+                    r, g, b = sp(r, e), sp(g, e), sp(b, e)
+                end
+                return r, g, b
+            end
+            dec = GCAE_dec3
+        end
+
+        p.R, p.G, p.B = dec(p.R, p.G, p.B, CsTf, InvDir, GamInv, UseMat,
+            MF11, MF12, MF13, MF21, MF22, MF23, MF31, MF32, MF33)
+        return p
+    end
+
+    -- Only re-encode if the decode actually ran: if the temp image fails to
+    -- allocate we stay in the plate's own space rather than encoding twice.
+    local srcImg = img
+    local xfActive = false
+    if needXf then
+        local sw = img.DataWindow
+        local swW = sw.right - sw.left
+        local swH = sw.top - sw.bottom
+        if swW > 0 and swH > 0 then
+            local lin = Image({
+                IMG_Like = img,
+                IMG_DataWindow = sw,
+                IMG_Depth = IMG_Depth_Float,
+                IMG_NoData = true,
+            })
+            if lin then
+                lin:MultiProcessPixels(nil,
+                    {
+                        CsTf = csTf,
+                        InvDir = invDir,
+                        GamInv = gamInv,
+                        UseMat = useMat,
+                        MF11 = mf[1],
+                        MF12 = mf[2],
+                        MF13 = mf[3],
+                        MF21 = mf[4],
+                        MF22 = mf[5],
+                        MF23 = mf[6],
+                        MF31 = mf[7],
+                        MF32 = mf[8],
+                        MF33 = mf[9],
+                    },
+                    sw.left, sw.bottom, swW, swH,
+                    img,
+                    decodePixel
+                )
+                srcImg = lin
+                xfActive = true
+            end
+        end
+    end
+
+    -- ------------------------------------------------------------------------
     -- Pixel function
     --
     -- MultiProcessPixels 在 worker context 執行：模組層的函式與 Process 的 local
     -- 都看不到，只有 userData 的 key（加上 threadinitfunc 寫進環境的 Samp）
-    -- 會被注入成全域。GCAE_gen2 建到 worker 全域，之後的 pixel 直接重用。
+    -- 會被注入成全域。GCAE_gen3 建到 worker 全域，之後的 pixel 直接重用。
     -- ------------------------------------------------------------------------
     local function processPixel(x, y, p)
-        local gen = GCAE_gen2
+        local gen = GCAE_gen3
 
         if not gen then
             local sin = math.sin
@@ -670,7 +1101,6 @@ function Process(req)
             local abs = math.abs
             local DEG = 3.14159265358979323846 / 180.0
             local EPS = 1.0e-6
-            local YR, YG, YB = 0.2126, 0.7152, 0.0722
 
             local function sampleAt(src, samp, sx, sy, edgeMode)
                 if edgeMode < 0.5 then
@@ -1020,7 +1450,8 @@ function Process(req)
                                          rtx, rty, rrot, rsc,
                                          gtx, gty, grot, gsc,
                                          btx, bty, brot, bsc,
-                                         proj, f, thetaMax, chroma)
+                                         proj, f, thetaMax, chroma,
+                                         yr, yg, yb, clampneg)
                 local fisheye = proj > 0.5
                 -- Same Amount / Radial as Transform (makeScale).
                 local amt = amount
@@ -1230,30 +1661,35 @@ function Process(req)
                 end
 
                 if chroma ~= 1.0 then
-                    local y = YR * r + YG * g + YB * b
+                    local y = yr * r + yg * g + yb * b
                     r = y + chroma * (r - y)
                     g = y + chroma * (g - y)
                     b = y + chroma * (b - y)
-                    if r < 0.0 then r = 0.0 end
-                    if g < 0.0 then g = 0.0 end
-                    if b < 0.0 then b = 0.0 end
+                    -- Only clip where negatives are meaningless: display
+                    -- primaries on their way to a display curve.
+                    if clampneg then
+                        if r < 0.0 then r = 0.0 end
+                        if g < 0.0 then g = 0.0 end
+                        if b < 0.0 then b = 0.0 end
+                    end
                 end
                 return r, g, b
             end
 
-            GCAE_gen2 = function(px, py, oR, oG, oB, oA,
-                                src, samp,
-                                cx, cy, rRef,
-                                amount, rad, wr, wg, wb,
-                                inner, outer, pwr, aspect, ana, fca, fsa,
-                                linX, linY, linFall,
-                                smear, n, edge, axial, allowMinify,
-                                rtx, rty, rrot, rsc,
-                                gtx, gty, grot, gsc,
-                                btx, bty, brot, bsc,
-                                preserve,
-                                proj, f, thetaMax,
-                                optical, chroma)
+            GCAE_gen3 = function(px, py, oR, oG, oB, oA,
+                                 src, samp,
+                                 cx, cy, rRef,
+                                 amount, rad, wr, wg, wb,
+                                 inner, outer, pwr, aspect, ana, fca, fsa,
+                                 linX, linY, linFall,
+                                 smear, n, edge, axial, allowMinify,
+                                 rtx, rty, rrot, rsc,
+                                 gtx, gty, grot, gsc,
+                                 btx, bty, brot, bsc,
+                                 preserve,
+                                 proj, f, thetaMax,
+                                 optical, chroma,
+                                 yr, yg, yb, clampneg)
                 -- Dest outside the 180° circle: leave the plate alone.
                 -- Samples past θ_max are skipped inside channel(); do not Wrap.
                 if proj > 0.5 then
@@ -1285,7 +1721,8 @@ function Process(req)
                         rtx, rty, rrot, rsc,
                         gtx, gty, grot, gsc,
                         btx, bty, brot, bsc,
-                        proj, f, thetaMax, chroma)
+                        proj, f, thetaMax, chroma,
+                        yr, yg, yb, clampneg)
                 else
                     local scR = makeScale(amount, rad, wr, w, rsc)
                     local scG = makeScale(amount, rad, wg, w, gsc)
@@ -1322,8 +1759,8 @@ function Process(req)
                 end
 
                 if preserve > 1.0e-6 then
-                    local y0 = YR * oR + YG * oG + YB * oB
-                    local y1 = YR * r + YG * g + YB * b
+                    local y0 = yr * oR + yg * oG + yb * oB
+                    local y1 = yr * r + yg * g + yb * b
                     if y1 * y1 > 1.0e-16 then
                         local s = 1.0 + preserve * (y0 / y1 - 1.0)
                         r = r * s
@@ -1335,7 +1772,7 @@ function Process(req)
                 return r, g, b, oA
             end
 
-            gen = GCAE_gen2
+            gen = GCAE_gen3
         end
 
         local r, g, b, a = gen(
@@ -1351,8 +1788,90 @@ function Process(req)
             BTx, BTy, BRot, BSc,
             Preserve,
             Proj, F, ThetaMax,
-            Optical, OptChroma
+            Optical, OptChroma,
+            YR, YG, YB, ClampNeg
         )
+
+        -- Back out of the process space. Exact inverse of GCAE_dec3, so the
+        -- circle-exterior pass-through above survives the round trip untouched.
+        if Xf then
+            local enc = GCAE_enc3
+
+            if not enc then
+                local function curve(v, cs, encode)
+                    local s = 1.0
+                    if v < 0.0 then
+                        v = -v
+                        s = -1.0
+                    end
+                    if encode then
+                        if cs == 1 then
+                            if v <= 0.0031308 then
+                                v = v * 12.92
+                            else
+                                v = 1.055 * v ^ (1.0 / 2.4) - 0.055
+                            end
+                        else
+                            if v < 0.01805396851081 then
+                                v = v * 4.5
+                            else
+                                v = 1.09929682680944 * v ^ 0.45 - 0.09929682680944
+                            end
+                        end
+                    else
+                        if cs == 1 then
+                            if v <= 0.04045 then
+                                v = v / 12.92
+                            else
+                                v = ((v + 0.055) / 1.055) ^ 2.4
+                            end
+                        else
+                            if v < 0.08124285829863 then
+                                v = v / 4.5
+                            else
+                                v = ((v + 0.09929682680944) / 1.09929682680944) ^ (1.0 / 0.45)
+                            end
+                        end
+                    end
+                    return s * v
+                end
+
+                local function sp(v, e)
+                    if v < 0.0 then
+                        return -((-v) ^ e)
+                    end
+                    return v ^ e
+                end
+
+                -- Step-for-step mirror of GCAE_dec3, reversed:
+                --   inv = false  gamma → matrix⁻¹ → encode
+                --   inv = true   gamma → decode → matrix⁻¹
+                GCAE_enc3 = function(r, g, b, cs, inv, e, um,
+                                     m11, m12, m13, m21, m22, m23, m31, m32, m33)
+                    if e ~= 1.0 then
+                        r, g, b = sp(r, e), sp(g, e), sp(b, e)
+                    end
+                    if cs > 0 and inv then
+                        r, g, b = curve(r, cs, false), curve(g, cs, false), curve(b, cs, false)
+                    end
+                    if um then
+                        r, g, b =
+                            m11 * r + m12 * g + m13 * b,
+                            m21 * r + m22 * g + m23 * b,
+                            m31 * r + m32 * g + m33 * b
+                    end
+                    if cs > 0 and not inv then
+                        r, g, b = curve(r, cs, true), curve(g, cs, true), curve(b, cs, true)
+                    end
+                    return r, g, b
+                end
+                enc = GCAE_enc3
+            end
+
+            r, g, b = enc(r, g, b, CsTf, InvDir, GamFwd, UseMat,
+                MI11, MI12, MI13, MI21, MI22, MI23, MI31, MI32, MI33)
+        end
+
         p.R = r
         p.G = g
         p.B = b
@@ -1361,7 +1880,7 @@ function Process(req)
     end
 
     local userData = {
-        Src = img,
+        Src = srcImg,
         Cx = cx,
         Cy = cy,
         RRef = rRef,
@@ -1403,6 +1922,24 @@ function Process(req)
         ThetaMax = thetaMax,
         Optical = optical,
         OptChroma = optChroma,
+        YR = yR,
+        YG = yG,
+        YB = yB,
+        ClampNeg = clampNeg,
+        Xf = xfActive,
+        CsTf = csTf,
+        InvDir = invDir,
+        GamFwd = procGamma,
+        UseMat = useMat,
+        MI11 = mi[1],
+        MI12 = mi[2],
+        MI13 = mi[3],
+        MI21 = mi[4],
+        MI22 = mi[5],
+        MI23 = mi[6],
+        MI31 = mi[7],
+        MI32 = mi[8],
+        MI33 = mi[9],
     }
 
     out:MultiProcessPixels(
@@ -1411,7 +1948,7 @@ function Process(req)
         end,
         userData,
         DWleft, DWbottom, DWwidth, DWheight,
-        img,
+        srcImg,
         processPixel
     )
 
