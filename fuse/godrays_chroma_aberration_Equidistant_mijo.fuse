@@ -732,8 +732,8 @@ function Process(req)
 
     if steps < 1 then
         steps = 1
-    elseif steps > 32 then
-        steps = 32
+    elseif steps > 1024 then
+        steps = 1024
     end
     steps = steps - steps % 1
 
