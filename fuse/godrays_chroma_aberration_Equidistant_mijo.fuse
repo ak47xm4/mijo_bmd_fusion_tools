@@ -1,4 +1,4 @@
--- Godrays Chroma Aberration Equidistant mijo
+﻿-- Godrays Chroma Aberration Equidistant mijo
 -- run in CPU
 --
 -- 把 Godrays 的「沿變換路徑多採樣」改成專業 compositor 用的色差。
@@ -12,6 +12,13 @@
 --   Axial     ：便宜的 LoCA（在最終取樣點做 plus-tap）
 -- Mode = Transform → 每通道 1 次（硬分離）
 -- Mode = Smear    → 沿 t=0..1 平均（GodRays 式光譜拖尾，較像實鏡）
+-- Mode = Optical  → 稜鏡光譜：每個 Step 是一段波長，各取一次樣。gel 走
+--                   violet → blue → cyan → green → yellow → orange → red
+--                   （紅通道在短波的旁瓣就是紫端的來源，跟 CIE r-bar 一樣）。
+--                   Amount / Radial 與 Transform 同一條 scale 公式；u = 0 / 0.5 / 1
+--                   剛好等於 Transform 的 B / G / R 三個 scale。
+--                   合成：每個通道只收自己的 gel，再除以自己的 gel 總和。
+--                   平場原封不動回來（不是回白），單一 tap 就是那段波長的顏色。
 --
 -- Projection：
 --   Rectilinear     — 現有 image-space inverse（pixel scale / rotate / translate）。
@@ -30,7 +37,7 @@
 --
 -- MultiProcessPixels 規則與 godrays_mijo.fuse 相同：
 --   processPixel 只看得到 userData 的 key。helper 惰性建到 worker 全域
---   （GCAE_gen，不跟原版 GCA_gen 搶 worker 全域）；長存 closure 絕不讀全域，
+--   （GCAE_gen2，不跟原版 GCA_gen 搶 worker 全域）；長存 closure 絕不讀全域，
 --   會變的值一律當參數傳入。threadinitfunc 幫每個 worker 配一個 Pixel。
 
 FuRegisterClass("GodraysChromaAberration_Equidistant_mijo", CT_Tool, {
@@ -94,7 +101,8 @@ function Create()
         INP_MaxScale = 2.0,
         INP_Default = 1.0,
         ICD_Center = 0.0,
-        INPS_StatusText = "Master intensity. Sign flips the spectrum. 0 is a copy.",
+        INPS_StatusText =
+        "Master intensity. Sign flips the spectrum. 0 is a copy. Optical uses the same Amount as Transform / Smear.",
     })
 
     InFringe = self:AddInput("Fringe", "Fringe", {
@@ -115,9 +123,11 @@ function Create()
         INP_Default = 1.0,
         INP_DoNotifyChanged = true,
         MBTNC_StretchToFit = true,
-        { MBTNC_AddButton = "Transform", MBTNCD_ButtonWidth = 0.5 },
-        { MBTNC_AddButton = "Smear",     MBTNCD_ButtonWidth = 0.5 },
-        INPS_StatusText = "Transform: one sample per channel (hard split). Smear: GodRays-style average along the path.",
+        { MBTNC_AddButton = "Transform", MBTNCD_ButtonWidth = 0.33 },
+        { MBTNC_AddButton = "Smear",     MBTNCD_ButtonWidth = 0.33 },
+        { MBTNC_AddButton = "Optical",   MBTNCD_ButtonWidth = 0.34 },
+        INPS_StatusText =
+        "Transform: one sample per RGB channel. Smear: average along the path. Optical: prism spectrum (violet → blue → cyan → green → yellow → orange → red). A flat area comes back unchanged; only displaced detail fringes.",
     })
 
     InSteps = self:AddInput("Steps", "Steps", {
@@ -127,7 +137,20 @@ function Create()
         INP_MinScale = 1.0,
         INP_MaxScale = 32.0,
         INP_Default = 8.0,
-        INPS_StatusText = "Smear samples per channel. 1 equals Transform. Higher = smoother fringe, slower.",
+        INPS_StatusText =
+        "Smear: samples per channel. Optical: wavelength taps (16–24 keeps the spectrum continuous; below 3 the gel starves and falls back to a plain smear). 1 equals Transform.",
+    })
+
+    InOptChroma = self:AddInput("Optical Chroma", "OpticalChroma", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.5,
+        INP_MaxScale = 2.5,
+        INP_Default = 1.0,
+        ICD_Center = 1.0,
+        IC_Visible = false,
+        INPS_StatusText =
+        "Optical only. Saturation of the reconstructed spectrum. 1 = physical prism. >1 pushes the rainbow, <1 fades it toward luma.",
     })
 
     -- ------------------------------------------------------------------
@@ -403,6 +426,7 @@ end
 function NotifyChanged(inp, param, time)
     if inp == InMode and param and type(param.Value) == "number" then
         InSteps:SetAttrs({ IC_Visible = param.Value > 0.5 })
+        InOptChroma:SetAttrs({ IC_Visible = param.Value > 1.5 })
     elseif inp == InProjection and param and type(param.Value) == "number" then
         InCircleRadius:SetAttrs({ IC_Visible = param.Value > 0.5 })
     end
@@ -493,6 +517,7 @@ function Process(req)
     local axial = InAxial:GetValue(req).Value
     local preserve = InPreserveLuma:GetValue(req).Value
     local edge = InEdge:GetValue(req).Value
+    local optChroma = InOptChroma:GetValue(req).Value
 
     if steps < 1 then
         steps = 1
@@ -521,10 +546,19 @@ function Process(req)
     if circleRadius < 0.05 then
         circleRadius = 0.05
     end
+    if optChroma < 0.0 then
+        optChroma = 0.0
+    end
 
-    -- Transform mode: one sample at t=1. Smear uses Steps along 0..1.
-    local smear = mode > 0.5
-    if not smear then
+    -- Transform: one sample at t=1. Smear: Steps along 0..1.
+    -- Optical: Steps wavelengths at each λ's full transform (not smeared).
+    -- Gels are built inside the worker from OpticalChroma (scalars only in userData).
+    local optical = 0.0
+    if mode > 1.5 then
+        optical = 1.0
+    end
+    local smear = mode > 0.5 and optical < 0.5
+    if mode < 0.5 then
         steps = 1
     end
 
@@ -623,10 +657,10 @@ function Process(req)
     --
     -- MultiProcessPixels 在 worker context 執行：模組層的函式與 Process 的 local
     -- 都看不到，只有 userData 的 key（加上 threadinitfunc 寫進環境的 Samp）
-    -- 會被注入成全域。GCAE_gen 建到 worker 全域，之後的 pixel 直接重用。
+    -- 會被注入成全域。GCAE_gen2 建到 worker 全域，之後的 pixel 直接重用。
     -- ------------------------------------------------------------------------
     local function processPixel(x, y, p)
-        local gen = GCAE_gen
+        local gen = GCAE_gen2
 
         if not gen then
             local sin = math.sin
@@ -944,7 +978,270 @@ function Process(req)
                 return acc
             end
 
-            GCAE_gen = function(px, py, oR, oG, oB, oA,
+            -- Barycentric channel blend for the *transform* parameters:
+            -- u=0 is pure blue, 0.5 pure green, 1 pure red. The three
+            -- coefficients sum to 1, so a tap's scale / shift / rotate is a
+            -- true interpolation of the per-channel controls — at u = 0 / 0.5 / 1
+            -- it reproduces Transform's B / G / R exactly, and the defaults
+            -- (scale 1, shift 0) stay neutral in between.
+            local function chanMix(u)
+                if u <= 0.5 then
+                    local t = u * 2.0
+                    return 0.0, t, 1.0 - t
+                end
+                local t = (u - 0.5) * 2.0
+                return t, 1.0 - t, 0.0
+            end
+
+            -- Prism gel for the *colour* of a tap: broad overlapping lobes,
+            -- so neighbouring wavelengths blend into cyan / yellow instead of
+            -- jumping between primaries. The short-u lobe on red is what puts
+            -- violet at the blue end — CIE r-bar has the same secondary lobe.
+            -- Quartic bumps, no exp / sin, so this stays cheap per tap.
+            local function bumpLobe(u, c, hw, amp)
+                local t = (u - c) / hw
+                if t <= -1.0 or t >= 1.0 then
+                    return 0.0
+                end
+                local v = 1.0 - t * t
+                return amp * v * v
+            end
+
+            local function spectrumAt(u)
+                return bumpLobe(u, 0.86, 0.46, 1.0) + bumpLobe(u, 0.00, 0.18, 0.55),
+                    bumpLobe(u, 0.52, 0.44, 1.0),
+                    bumpLobe(u, 0.16, 0.46, 1.0)
+            end
+
+            local function opticalGather(px, py, src, samp, oR, oG, oB,
+                                         wr, wg, wb, w, cx, cy, amount, rad,
+                                         ana, fca, fsa, linX, linY, linFall,
+                                         n, edge, axial, allowMinify,
+                                         rtx, rty, rrot, rsc,
+                                         gtx, gty, grot, gsc,
+                                         btx, bty, brot, bsc,
+                                         proj, f, thetaMax, chroma)
+                local fisheye = proj > 0.5
+                -- Same Amount / Radial as Transform (makeScale).
+                local amt = amount
+
+                -- Minify lift, identical to the Transform path: the spectrum's
+                -- scale is a convex blend of the three channel scales, so the
+                -- extremes are exactly Transform's scR / scG / scB.
+                local lift = 0.0
+                if not allowMinify then
+                    local m = makeScale(amt, rad, wr, w, rsc)
+                    local mG = makeScale(amt, rad, wg, w, gsc)
+                    local mB = makeScale(amt, rad, wb, w, bsc)
+                    if mG < m then m = mG end
+                    if mB < m then m = mB end
+                    if m < 1.0 then
+                        lift = 1.0 - m
+                    end
+                end
+
+                local accR, accG, accB = 0.0, 0.0, 0.0
+                local totR, totG, totB = 0.0, 0.0, 0.0
+                local avgR, avgG, avgB = 0.0, 0.0, 0.0
+                local hits = 0
+                local denom = n - 1
+                if denom < 1 then
+                    denom = 1
+                end
+
+                for i = 1, n do
+                    local u = 0.5
+                    if n > 1 then
+                        u = (i - 1) / denom
+                    end
+                    local cr, cg, cb = chanMix(u)
+                    local hr, hg, hb = spectrumAt(u)
+                    local weight = wr * cr + wg * cg + wb * cb
+                    local esc = rsc * cr + gsc * cg + bsc * cb
+                    local sc = makeScale(amt, rad, weight, w, esc) + lift
+                    local etx = rtx * cr + gtx * cg + btx * cb
+                    local ety = rty * cr + gty * cg + bty * cb
+                    local erot = rrot * cr + grot * cg + brot * cb
+
+                    local tx, ty = 0.0, 0.0
+                    local txPix, tyPix, txAng, tyAng = 0.0, 0.0, 0.0, 0.0
+                    local lf = 1.0
+                    if linFall then
+                        lf = w
+                    end
+                    if fisheye then
+                        if linFall then
+                            txAng = linX * amt * weight * lf + etx * amt
+                            tyAng = linY * amt * weight * lf + ety * amt
+                        else
+                            txPix = linX * amt * weight
+                            tyPix = linY * amt * weight
+                            txAng = etx * amt
+                            tyAng = ety * amt
+                        end
+                    else
+                        tx = linX * amt * weight * lf + etx * amt
+                        ty = linY * amt * weight * lf + ety * amt
+                    end
+                    local rot = erot * amt
+                    local ax = axial * amt * abs(weight)
+
+                    local noT = true
+                    if fisheye then
+                        noT = txPix * txPix + tyPix * tyPix < 1.0e-20
+                            and txAng * txAng + tyAng * tyAng < 1.0e-20
+                    else
+                        noT = tx * tx + ty * ty < 1.0e-20
+                    end
+
+                    local sR, sG, sB = oR, oG, oB
+                    local got = true
+                    if ax > 0.01
+                        or rot * rot >= 1.0e-20
+                        or (not noT)
+                        or (sc - 1.0) * (sc - 1.0) >= 1.0e-20 then
+                        got = false
+                        if not fisheye then
+                            local sx, sy = inv(px, py, cx, cy, tx, ty, rot, sc, ana, fca, fsa, 1.0)
+                            sampleAt(src, samp, sx, sy, edge)
+                            sR, sG, sB = samp.R, samp.G, samp.B
+                            got = true
+                            if ax > 0.01 then
+                                sampleAt(src, samp, sx + ax, sy, edge)
+                                local r1, g1, b1 = samp.R, samp.G, samp.B
+                                sampleAt(src, samp, sx - ax, sy, edge)
+                                local r2, g2, b2 = samp.R, samp.G, samp.B
+                                sampleAt(src, samp, sx, sy + ax, edge)
+                                local r3, g3, b3 = samp.R, samp.G, samp.B
+                                sampleAt(src, samp, sx, sy - ax, edge)
+                                sR = (sR + r1 + r2 + r3 + samp.R) * 0.2
+                                sG = (sG + g1 + g2 + g3 + samp.G) * 0.2
+                                sB = (sB + b1 + b2 + b3 + samp.B) * 0.2
+                            end
+                        else
+                            local sx, sy, sdx, sdy, sdz = inv_fe(
+                                px, py, cx, cy, txPix, tyPix, txAng, tyAng,
+                                rot, sc, ana, fca, fsa, 1.0, f, thetaMax
+                            )
+                            if sx ~= nil then
+                                sampleAt(src, samp, sx, sy, edge)
+                                sR, sG, sB = samp.R, samp.G, samp.B
+                                got = true
+                                if ax > 0.01 then
+                                    local ang = ax / f
+                                    local ex, ey, ez, nx, ny, nz = fe_east_north(sdx, sdy, sdz)
+                                    local x1 = sdx + ex * ang
+                                    local y1 = sdy + ey * ang
+                                    local z1 = sdz + ez * ang
+                                    local L = sqrt(x1 * x1 + y1 * y1 + z1 * z1)
+                                    local r1, g1, b1 = 0.0, 0.0, 0.0
+                                    if L >= 1.0e-12 then
+                                        local qx, qy = fe_project(x1 / L, y1 / L, z1 / L, cx, cy, f, thetaMax)
+                                        if qx ~= nil then
+                                            sampleAt(src, samp, qx, qy, edge)
+                                            r1, g1, b1 = samp.R, samp.G, samp.B
+                                        end
+                                    end
+                                    local x2 = sdx - ex * ang
+                                    local y2 = sdy - ey * ang
+                                    local z2 = sdz - ez * ang
+                                    L = sqrt(x2 * x2 + y2 * y2 + z2 * z2)
+                                    local r2, g2, b2 = 0.0, 0.0, 0.0
+                                    if L >= 1.0e-12 then
+                                        local qx, qy = fe_project(x2 / L, y2 / L, z2 / L, cx, cy, f, thetaMax)
+                                        if qx ~= nil then
+                                            sampleAt(src, samp, qx, qy, edge)
+                                            r2, g2, b2 = samp.R, samp.G, samp.B
+                                        end
+                                    end
+                                    local x3 = sdx + nx * ang
+                                    local y3 = sdy + ny * ang
+                                    local z3 = sdz + nz * ang
+                                    L = sqrt(x3 * x3 + y3 * y3 + z3 * z3)
+                                    local r3, g3, b3 = 0.0, 0.0, 0.0
+                                    if L >= 1.0e-12 then
+                                        local qx, qy = fe_project(x3 / L, y3 / L, z3 / L, cx, cy, f, thetaMax)
+                                        if qx ~= nil then
+                                            sampleAt(src, samp, qx, qy, edge)
+                                            r3, g3, b3 = samp.R, samp.G, samp.B
+                                        end
+                                    end
+                                    local x4 = sdx - nx * ang
+                                    local y4 = sdy - ny * ang
+                                    local z4 = sdz - nz * ang
+                                    L = sqrt(x4 * x4 + y4 * y4 + z4 * z4)
+                                    local r4, g4, b4 = 0.0, 0.0, 0.0
+                                    if L >= 1.0e-12 then
+                                        local qx, qy = fe_project(x4 / L, y4 / L, z4 / L, cx, cy, f, thetaMax)
+                                        if qx ~= nil then
+                                            sampleAt(src, samp, qx, qy, edge)
+                                            r4, g4, b4 = samp.R, samp.G, samp.B
+                                        end
+                                    end
+                                    sR = (sR + r1 + r2 + r3 + r4) * 0.2
+                                    sG = (sG + g1 + g2 + g3 + g4) * 0.2
+                                    sB = (sB + b1 + b2 + b3 + b4) * 0.2
+                                end
+                            end
+                        end
+                    end
+
+                    -- A channel only collects the wavelengths it can see, and
+                    -- only valid taps count toward its gel sum — so taps skipped
+                    -- past θ_max don't darken the edge of the 180° circle.
+                    if got then
+                        accR = accR + sR * hr
+                        accG = accG + sG * hg
+                        accB = accB + sB * hb
+                        totR = totR + hr
+                        totG = totG + hg
+                        totB = totB + hb
+                        avgR = avgR + sR
+                        avgG = avgG + sG
+                        avgB = avgB + sB
+                        hits = hits + 1
+                    end
+                end
+
+                if hits < 1 then
+                    return oR, oG, oB
+                end
+
+                -- Dividing each channel by its own gel sum is what keeps this
+                -- energy-conserving: a flat area reconstructs the plate exactly
+                -- (colour included) and a lone tap shows its prism hue. Too few
+                -- Steps can leave a channel with no gel at all — fall back to the
+                -- plain mean there rather than dropping it to black.
+                local r, g, b
+                if totR > 1.0e-6 then
+                    r = accR / totR
+                else
+                    r = avgR / hits
+                end
+                if totG > 1.0e-6 then
+                    g = accG / totG
+                else
+                    g = avgG / hits
+                end
+                if totB > 1.0e-6 then
+                    b = accB / totB
+                else
+                    b = avgB / hits
+                end
+
+                if chroma ~= 1.0 then
+                    local y = YR * r + YG * g + YB * b
+                    r = y + chroma * (r - y)
+                    g = y + chroma * (g - y)
+                    b = y + chroma * (b - y)
+                    if r < 0.0 then r = 0.0 end
+                    if g < 0.0 then g = 0.0 end
+                    if b < 0.0 then b = 0.0 end
+                end
+                return r, g, b
+            end
+
+            GCAE_gen2 = function(px, py, oR, oG, oB, oA,
                                 src, samp,
                                 cx, cy, rRef,
                                 amount, rad, wr, wg, wb,
@@ -955,7 +1252,8 @@ function Process(req)
                                 gtx, gty, grot, gsc,
                                 btx, bty, brot, bsc,
                                 preserve,
-                                proj, f, thetaMax)
+                                proj, f, thetaMax,
+                                optical, chroma)
                 -- Dest outside the 180° circle: leave the plate alone.
                 -- Samples past θ_max are skipped inside channel(); do not Wrap.
                 if proj > 0.5 then
@@ -978,38 +1276,50 @@ function Process(req)
                 end
                 local w = u ^ pwr
 
-                local scR = makeScale(amount, rad, wr, w, rsc)
-                local scG = makeScale(amount, rad, wg, w, gsc)
-                local scB = makeScale(amount, rad, wb, w, bsc)
+                local r, g, b
+                if optical > 0.5 then
+                    r, g, b = opticalGather(px, py, src, samp, oR, oG, oB,
+                        wr, wg, wb, w, cx, cy, amount, rad,
+                        ana, fca, fsa, linX, linY, linFall,
+                        n, edge, axial, allowMinify,
+                        rtx, rty, rrot, rsc,
+                        gtx, gty, grot, gsc,
+                        btx, bty, brot, bsc,
+                        proj, f, thetaMax, chroma)
+                else
+                    local scR = makeScale(amount, rad, wr, w, rsc)
+                    local scG = makeScale(amount, rad, wg, w, gsc)
+                    local scB = makeScale(amount, rad, wb, w, bsc)
 
-                -- Minify (scale < 1) samples *away* from center, i.e. off the frame
-                -- / toward larger θ. That fills the shrinking channel with Black
-                -- and paints a solid primary border. Lift all three scales so
-                -- min == 1; relative R/G/B split is unchanged.
-                if not allowMinify then
-                    local m = scR
-                    if scG < m then m = scG end
-                    if scB < m then m = scB end
-                    if m < 1.0 then
-                        local lift = 1.0 - m
-                        scR = scR + lift
-                        scG = scG + lift
-                        scB = scB + lift
+                    -- Minify (scale < 1) samples *away* from center, i.e. off the frame
+                    -- / toward larger θ. That fills the shrinking channel with Black
+                    -- and paints a solid primary border. Lift all three scales so
+                    -- min == 1; relative R/G/B split is unchanged.
+                    if not allowMinify then
+                        local m = scR
+                        if scG < m then m = scG end
+                        if scB < m then m = scB end
+                        if m < 1.0 then
+                            local lift = 1.0 - m
+                            scR = scR + lift
+                            scG = scG + lift
+                            scB = scB + lift
+                        end
                     end
-                end
 
-                local r = channel(px, py, src, samp, 0, oR, wr, rtx, rty, rrot,
-                    scR, w, cx, cy, amount, ana, fca, fsa,
-                    linX, linY, linFall, smear, n, edge, axial,
-                    proj, f, thetaMax)
-                local g = channel(px, py, src, samp, 1, oG, wg, gtx, gty, grot,
-                    scG, w, cx, cy, amount, ana, fca, fsa,
-                    linX, linY, linFall, smear, n, edge, axial,
-                    proj, f, thetaMax)
-                local b = channel(px, py, src, samp, 2, oB, wb, btx, bty, brot,
-                    scB, w, cx, cy, amount, ana, fca, fsa,
-                    linX, linY, linFall, smear, n, edge, axial,
-                    proj, f, thetaMax)
+                    r = channel(px, py, src, samp, 0, oR, wr, rtx, rty, rrot,
+                        scR, w, cx, cy, amount, ana, fca, fsa,
+                        linX, linY, linFall, smear, n, edge, axial,
+                        proj, f, thetaMax)
+                    g = channel(px, py, src, samp, 1, oG, wg, gtx, gty, grot,
+                        scG, w, cx, cy, amount, ana, fca, fsa,
+                        linX, linY, linFall, smear, n, edge, axial,
+                        proj, f, thetaMax)
+                    b = channel(px, py, src, samp, 2, oB, wb, btx, bty, brot,
+                        scB, w, cx, cy, amount, ana, fca, fsa,
+                        linX, linY, linFall, smear, n, edge, axial,
+                        proj, f, thetaMax)
+                end
 
                 if preserve > 1.0e-6 then
                     local y0 = YR * oR + YG * oG + YB * oB
@@ -1025,7 +1335,7 @@ function Process(req)
                 return r, g, b, oA
             end
 
-            gen = GCAE_gen
+            gen = GCAE_gen2
         end
 
         local r, g, b, a = gen(
@@ -1040,7 +1350,8 @@ function Process(req)
             GTx, GTy, GRot, GSc,
             BTx, BTy, BRot, BSc,
             Preserve,
-            Proj, F, ThetaMax
+            Proj, F, ThetaMax,
+            Optical, OptChroma
         )
         p.R = r
         p.G = g
@@ -1090,6 +1401,8 @@ function Process(req)
         Proj = proj,
         F = f,
         ThetaMax = thetaMax,
+        Optical = optical,
+        OptChroma = optChroma,
     }
 
     out:MultiProcessPixels(

@@ -1,9 +1,17 @@
--- Glint mijo
+-- Glint Equidistand mijo
 -- run in CPU
 --
 -- Nuke Glint：高光沿 N 個等分角度做離散位移拷貝，組成星狀 streak。
 -- 額外功能（現成工具沒有的）：獨立 Weight 輸入用 Z / Red / Luma 控制
 -- 每個光源自己的 ray 長度（近／遠各一組倍率）。
+--
+-- Projection：
+--   Rectilinear     — Mode A：image-space 直線（p - dist*(ux,uy)），sensor / star filter。
+--   Equidistant 180 — Mode B camera-fixed：unproject → Rodrigues 繞固定 3D 軸 → project。
+--     每條 ray 的軸 A = normalize(cross(+Z, T))，T 在光軸切面（aspect 先乘再正規化）。
+--     Length / Ray Width 仍是 pixel（光軸上的弧長）；內部 dθ = px / f，等 Δθ 取樣。
+--     Width 是切平面偏移再 project，不是 geodesic 走完後再加像素。
+--     θ > θ_max 的 sample 跳過，不從圓的另一側 wrap 進來。
 --
 -- 演算法（gather）：
 --   每個輸出 pixel，沿每條 ray 往回走，取樣來源高光。
@@ -11,7 +19,7 @@
 --   （斷線則用 Input）；Gamma 打在亮度上、色相保持 plate，再乘
 --   lerp(From, To, dist / length_of_that_source)。
 --   Stepped：固定 steps 格，Nuke 那種看得見的拷貝。
---   Smooth ：約 1 sample / pixel，連續 streak。
+--   Smooth ：約 1 sample / pixel（Equidistant：約 1 sample / 光軸像素 = 等 Δθ）。
 --   Max    ：各 sample 逐通道取亮（Nuke 預設，Smooth 也建議開著）。
 --            關掉則相加：Stepped 是 Nuke 的拷貝疊加；Smooth 會較亮。
 --   Normalize Steps：Add 模式把每條 ray 除以 sample 數，Steps 拉高亮度不變。
@@ -39,14 +47,14 @@
 --
 -- MultiProcessPixels 規則與 godrays_mijo.fuse 相同：
 --   processPixel 只看得到 userData 的 key。helper 惰性建到 worker 全域
---   （GLT_gen）；長存 closure 絕不讀全域，會變的值一律當參數傳入。
---   threadinitfunc 幫每個 worker 配 Pixel，給 SamplePixelB 用。
+--   （GLTE_gen，不跟原版 GLT_gen 搶）；長存 closure 絕不讀全域，會變的值
+--   一律當參數傳入。threadinitfunc 幫每個 worker 配 Pixel，給 SamplePixelB 用。
 
-FuRegisterClass("Glint_mijo", CT_Tool, {
-    REGS_Name = "Glint mijo",
+FuRegisterClass("Glint_Equidistand_mijo", CT_Tool, {
+    REGS_Name = "Glint Equidistand mijo",
     REGS_Category = "mijo",
     REGS_OpIconString = "GLt",
-    REGS_OpDescription = "Nuke-style star glint with per-source length from a Weight / Z input",
+    REGS_OpDescription = "Nuke-style star glint; Equidistant 180 camera-fixed geodesic streaks",
     REG_NoObjMatCtrls = true,
     REG_NoMotionBlurCtrls = true,
     REG_SupportsDoD = true,
@@ -79,6 +87,38 @@ function Create()
         LINK_Main = 1,
     })
 
+    InProjection = self:AddInput("Projection", "Projection", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "MultiButtonControl",
+        INP_Integer = true,
+        INP_Default = 1.0,
+        INP_DoNotifyChanged = true,
+        MBTNC_StretchToFit = true,
+        { MBTNC_AddButton = "Rectilinear",     MBTNCD_ButtonWidth = 0.5 },
+        { MBTNC_AddButton = "Equidistant 180", MBTNCD_ButtonWidth = 0.5 },
+        INPS_StatusText =
+        "Rectilinear: straight image-plane streaks (sensor / star filter). Equidistant 180: camera-fixed geodesics on the hemisphere.",
+    })
+
+    InFisheyeCentre = self:AddInput("Fisheye Centre", "FisheyeCentre", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "OffsetControl",
+        INPID_PreviewControl = "CrosshairControl",
+        INP_DefaultX = 0.5,
+        INP_DefaultY = 0.5,
+        INPS_StatusText = "Optical axis for unproject / project. Hidden in Rectilinear. Default frame centre.",
+    })
+
+    InCircleRadius = self:AddInput("Circle Radius", "CircleRadius", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.05,
+        INP_MaxScale = 1.5,
+        INP_Default = 0.5,
+        INPS_StatusText =
+        "0.5 = inscribed 180° circle (half min-dimension). >0.5 full-frame / cropped. <0.5 letterboxed circle.",
+    })
+
     InRays = self:AddInput("No. of Rays", "Rays", {
         LINKID_DataType = "Number",
         INPID_InputControl = "SliderControl",
@@ -95,7 +135,8 @@ function Create()
         INP_MinScale = 0.0,
         INP_MaxScale = 200.0,
         INP_Default = 50.0,
-        INPS_StatusText = "Master ray length in pixels, before Weight / Odd / Aspect.",
+        INPS_StatusText =
+        "Master ray length in pixels at the optical centre, before Weight / Odd / Aspect. Equidistant converts to arc length via f = R / (π/2).",
     })
 
     InAspect = self:AddInput("Aspect", "Aspect", {
@@ -104,7 +145,8 @@ function Create()
         INP_MinScale = 0.25,
         INP_MaxScale = 4.0,
         INP_Default = 1.0,
-        INPS_StatusText = "Star ellipse. >1 stretches horizontally (anamorphic). <1 is taller.",
+        INPS_StatusText =
+        "Star ellipse. >1 stretches horizontally (anamorphic). Equidistant applies this in camera XY before building the rotation axis.",
     })
 
     InOddLen = self:AddInput("Odd Ray Length", "OddLength", {
@@ -170,7 +212,7 @@ function Create()
         INP_MaxScale = 4.0,
         INP_Default = 1.25,
         INPS_StatusText =
-        "Coverage width in pixels, perpendicular to each ray. 0.5 = a 1px aliased line. 1.25 catches small highlights.",
+        "Coverage width in pixels at the optical centre, perpendicular to each ray. Equidistant: tangent-plane offset, then project.",
     })
 
     InSoft = self:AddInput("Soft", "Soft", {
@@ -362,12 +404,19 @@ function NotifyChanged(inp, param, time)
     if inp == InMode and param and type(param.Value) == "number" then
         InSteps:SetAttrs({ IC_Visible = param.Value < 0.5 })
     end
+    if inp == InProjection and param and type(param.Value) == "number" then
+        local fe = param.Value > 0.5
+        InFisheyeCentre:SetAttrs({ IC_Visible = fe })
+        InCircleRadius:SetAttrs({ IC_Visible = fe })
+    end
 end
 
 -- IMG_DataWindow / IMG_ValidWindow 只接受 FuRectInt。fuse sandbox 沒有
 -- FuRectInt() 建構子，所以只用 Image / Request 已經給的 rect：
 --   img.DataWindow、GetInputDoD():Intersect()、GetRoI().ValidWindow。
 -- GetRoI() 本身是 ImageDomain，不能直接丟進 Image{}。
+-- Equidistant 測地線不是直線：不要縮成 rectilinear AABB，維持 input DoD ∩ RoI。
+-- 圓外 pixel 在 processPixel 裡 skip sample（不 emit），不做圓形 DoD。
 local function outputWindows(req, img)
     local datawnd = img.DataWindow
     local dod = req:GetInputDoD(InImage)
@@ -411,6 +460,9 @@ function Process(req)
 
     local wimg = InWeight:GetValue(req)
     local cimg = InColor:GetValue(req)
+    local proj = InProjection:GetValue(req).Value
+    local lens = InFisheyeCentre:GetValue(req)
+    local circleRadius = InCircleRadius:GetValue(req).Value
     local nRays = InRays:GetValue(req).Value
     local length = InLength:GetValue(req).Value
     local aspect = InAspect:GetValue(req).Value
@@ -524,6 +576,20 @@ function Process(req)
         end
     end
 
+    local width = img.Width
+    local height = img.Height
+    local cxL = lens.X * width
+    local cyL = lens.Y * height
+    if circleRadius < 0.05 then
+        circleRadius = 0.05
+    end
+    local thetaMax = 3.14159265358979323846 * 0.5
+    local R = circleRadius * math.min(width, height)
+    if R < 1.0 then
+        R = 1.0
+    end
+    local f = R / thetaMax
+
     local datawnd, validwnd = outputWindows(req, img)
 
     local DWleft = datawnd.left
@@ -602,15 +668,16 @@ function Process(req)
     --
     -- MultiProcessPixels 在 worker context 執行：模組層的函式與 Process 的 local
     -- 都看不到，只有 userData 的 key（加上 threadinitfunc 寫進環境的 Samp /
-    -- Wsamp / Csamp）會被注入成全域。GLT_gen 建到 worker 全域，之後的 pixel 直接重用。
+    -- Wsamp / Csamp）會被注入成全域。GLTE_gen 建到 worker 全域，之後的 pixel 直接重用。
     -- ------------------------------------------------------------------------
     local function processPixel(x, y, p)
-        local gen = GLT_gen
+        local gen = GLTE_gen
 
         if not gen then
             local sin = math.sin
             local cos = math.cos
             local sqrt = math.sqrt
+            local atan2 = math.atan2
             local DEG2RAD = 3.14159265358979323846 / 180.0
             local SCALE_EPS = 1.0e-6
             local SMOOTH_CAP = 256
@@ -702,18 +769,57 @@ function Process(req)
                 return (bright - lo) / soft
             end
 
+            local function fe_unproject(x, y, cx, cy, f, thetaMax)
+                local dx, dy = x - cx, y - cy
+                local r = sqrt(dx * dx + dy * dy)
+                local theta = r / f
+                if theta > thetaMax then
+                    return nil
+                end
+                local phi = atan2(dy, dx)
+                local st, ct = sin(theta), cos(theta)
+                return st * cos(phi), st * sin(phi), ct
+            end
+
+            local function fe_project(dx, dy, dz, cx, cy, f, thetaMax)
+                local theta = atan2(sqrt(dx * dx + dy * dy), dz)
+                if theta > thetaMax or dz < 0.0 then
+                    return nil
+                end
+                local phi = atan2(dy, dx)
+                local r = f * theta
+                return cx + r * cos(phi), cy + r * sin(phi)
+            end
+
+            local function fe_rodrigues(vx, vy, vz, kx, ky, kz, a)
+                local ca, sa = cos(a), sin(a)
+                local dot = kx * vx + ky * vy + kz * vz
+                local cxp = ky * vz - kz * vy
+                local cyp = kz * vx - kx * vz
+                local czp = kx * vy - ky * vx
+                local om = 1.0 - ca
+                return vx * ca + cxp * sa + kx * dot * om,
+                    vy * ca + cyp * sa + ky * dot * om,
+                    vz * ca + czp * sa + kz * dot * om
+            end
+
             -- 會變動的值一律走參數，不讀全域 —— 這個 closure 會活過多次
             -- Process 呼叫，讀全域有機會綁到過期的環境表。
-            GLT_gen = function(px, py, src, samp, wsrc, wsamp, hasW,
-                               csrc, csamp, hasC, cScaleX, cScaleY,
-                               nRays, length, aspect, oddlen, rotDeg,
-                               nSteps, smooth, doMax, effectOnly, normSteps,
-                               tol, gam, maxWMul,
-                               zNear, zFar, nearLen, farLen, wChan,
-                               fr, fg, fb, tr, tg, tb,
-                               wScaleX, wScaleY,
-                               rayWidth, soft, denseAlong,
-                               srcR, srcG, srcB, srcA)
+            --
+            -- Rectilinear: sx = px - dist*ux, width in pixels along (-uy, ux).
+            -- Equidistant camera-fixed: dest dir Rodrigues about A by -dist/f;
+            -- width is an extra rotation about the path tangent by off/f, then project.
+            GLTE_gen = function(px, py, src, samp, wsrc, wsamp, hasW,
+                                csrc, csamp, hasC, cScaleX, cScaleY,
+                                nRays, length, aspect, oddlen, rotDeg,
+                                nSteps, smooth, doMax, effectOnly, normSteps,
+                                tol, gam, maxWMul,
+                                zNear, zFar, nearLen, farLen, wChan,
+                                fr, fg, fb, tr, tg, tb,
+                                wScaleX, wScaleY,
+                                rayWidth, soft, denseAlong,
+                                srcR, srcG, srcB, srcA,
+                                proj, cxL, cyL, f, thetaMax)
                 local useMax = doMax > 0.5
                 local accR, accG, accB
                 if useMax then
@@ -729,6 +835,7 @@ function Process(req)
                 local useGamma = (gam > 1.000001 or gam < 0.999999)
                 local isSmooth = smooth > 0.5
                 local useDense = denseAlong > 0.5
+                local fisheye = proj > 0.5
 
                 local nTaps = 1
                 if rayWidth > 0.51 then
@@ -780,7 +887,13 @@ function Process(req)
                     end
                 end
 
-                if maxWMul >= SCALE_EPS then
+                local destX, destY, destZ, destOk
+                if fisheye then
+                    destX, destY, destZ = fe_unproject(px, py, cxL, cyL, f, thetaMax)
+                    destOk = destX ~= nil
+                end
+
+                if maxWMul >= SCALE_EPS and ((not fisheye) or destOk) then
                     local slice = 360.0 / nRays
                     for i = 0, nRays - 1 do
                         local ang = (rotDeg + i * slice) * DEG2RAD
@@ -794,6 +907,8 @@ function Process(req)
                         local uy = dy / mag
                         local pxp = -uy
                         local pyp = ux
+                        -- Camera-fixed axis: A = normalize(cross(+Z, T)) = (-uy, ux, 0)
+                        local ax, ay = -uy, ux
                         local oddMul = 1.0
                         if i % 2 == 1 then
                             oddMul = oddlen
@@ -848,59 +963,102 @@ function Process(req)
                                     end
                                 end
                                 if stepW > 0.0 then
-                                    local sx0 = px - dist * ux
-                                    local sy0 = py - dist * uy
-                                    local t = 0
-                                    while t < nTaps do
-                                        local off = 0.0
-                                        local tw = 1.0
-                                        if nTaps > 1 then
-                                            off = -rayWidth + t * tapSpan
-                                            local aoff = off
-                                            if aoff < 0.0 then aoff = -aoff end
-                                            tw = 1.0 - aoff / rayWidth
-                                            if tw > 0.0 then
-                                                tw = tw / tapWSum
-                                            end
-                                        end
-                                        if tw > 0.0 then
-                                            local sx = sx0 + pxp * off
-                                            local sy = sy0 + pyp * off
-                                            src:SamplePixelB(sx, sy, samp)
-                                            local gate = emitGate(brightOf(samp.R, samp.G, samp.B), tol, soft)
-                                            if gate > 0.0 then
-                                                local actualL = walkLen * (
-                                                    weightMul(hasW, wsrc, wsamp, sx, sy, wScaleX, wScaleY,
-                                                        wChan, zNear, zFar, nearLen, farLen) / maxWMul
-                                                )
-                                                if dist <= actualL + rayWidth then
-                                                    local colorT = 1.0
-                                                    if actualL > SCALE_EPS then
-                                                        colorT = dist / actualL
-                                                        if colorT > 1.0 then
-                                                            colorT = 1.0
-                                                        end
-                                                    end
-                                                    local cr, cg, cb = plateColor(hasC, csrc, csamp, sx, sy,
-                                                        cScaleX, cScaleY, samp.R, samp.G, samp.B)
-                                                    local sr, sg, sb = tintSample(cr, cg, cb, colorT,
-                                                        gam, useGamma, fr, fg, fb, tr, tg, tb)
-                                                    local w = gate * tw * stepW
-                                                    sr, sg, sb = sr * w, sg * w, sb * w
-                                                    if useMax then
-                                                        if sr > accR then accR = sr end
-                                                        if sg > accG then accG = sg end
-                                                        if sb > accB then accB = sb end
-                                                    else
-                                                        accR = accR + sr * addScale
-                                                        accG = accG + sg * addScale
-                                                        accB = accB + sb * addScale
-                                                    end
-                                                    accN = accN + 1
+                                    local dxs, dys, dzs
+                                    local pathOk = true
+                                    if fisheye then
+                                        dxs, dys, dzs = fe_rodrigues(
+                                            destX, destY, destZ, ax, ay, 0.0, -(dist / f)
+                                        )
+                                        pathOk = dzs >= 0.0
+                                    end
+                                    if pathOk then
+                                        local t = 0
+                                        while t < nTaps do
+                                            local off = 0.0
+                                            local tw = 1.0
+                                            if nTaps > 1 then
+                                                off = -rayWidth + t * tapSpan
+                                                local aoff = off
+                                                if aoff < 0.0 then aoff = -aoff end
+                                                tw = 1.0 - aoff / rayWidth
+                                                if tw > 0.0 then
+                                                    tw = tw / tapWSum
                                                 end
                                             end
+                                            if tw > 0.0 then
+                                                local sx, sy, sampleOk
+                                                if not fisheye then
+                                                    sx = px - dist * ux + pxp * off
+                                                    sy = py - dist * uy + pyp * off
+                                                    sampleOk = true
+                                                else
+                                                    local wx, wy, wz = dxs, dys, dzs
+                                                    if nTaps > 1 then
+                                                        local aoff = off
+                                                        if aoff < 0.0 then aoff = -aoff end
+                                                        if aoff > SCALE_EPS then
+                                                            -- Path tangent cross(A, dir_s); rotate about it by off/f.
+                                                            local tx = ay * wz
+                                                            local ty = -ax * wz
+                                                            local tz = ax * wy - ay * wx
+                                                            local tlen = sqrt(tx * tx + ty * ty + tz * tz)
+                                                            if tlen > SCALE_EPS then
+                                                                local invt = 1.0 / tlen
+                                                                wx, wy, wz = fe_rodrigues(
+                                                                    wx, wy, wz,
+                                                                    tx * invt, ty * invt, tz * invt,
+                                                                    off / f
+                                                                )
+                                                            end
+                                                        end
+                                                    end
+                                                    if wz < 0.0 then
+                                                        sampleOk = false
+                                                    else
+                                                        sx, sy = fe_project(
+                                                            wx, wy, wz, cxL, cyL, f, thetaMax
+                                                        )
+                                                        sampleOk = sx ~= nil
+                                                    end
+                                                end
+                                                if sampleOk then
+                                                    src:SamplePixelB(sx, sy, samp)
+                                                    local gate = emitGate(brightOf(samp.R, samp.G, samp.B), tol, soft)
+                                                    if gate > 0.0 then
+                                                        local actualL = walkLen * (
+                                                            weightMul(hasW, wsrc, wsamp, sx, sy, wScaleX, wScaleY,
+                                                                wChan, zNear, zFar, nearLen, farLen) / maxWMul
+                                                        )
+                                                        if dist <= actualL + rayWidth then
+                                                            local colorT = 1.0
+                                                            if actualL > SCALE_EPS then
+                                                                colorT = dist / actualL
+                                                                if colorT > 1.0 then
+                                                                    colorT = 1.0
+                                                                end
+                                                            end
+                                                            local cr, cg, cb = plateColor(hasC, csrc, csamp, sx, sy,
+                                                                cScaleX, cScaleY, samp.R, samp.G, samp.B)
+                                                            local sr, sg, sb = tintSample(cr, cg, cb, colorT,
+                                                                gam, useGamma, fr, fg, fb, tr, tg, tb)
+                                                            local w = gate * tw * stepW
+                                                            sr, sg, sb = sr * w, sg * w, sb * w
+                                                            if useMax then
+                                                                if sr > accR then accR = sr end
+                                                                if sg > accG then accG = sg end
+                                                                if sb > accB then accB = sb end
+                                                            else
+                                                                accR = accR + sr * addScale
+                                                                accG = accG + sg * addScale
+                                                                accB = accB + sb * addScale
+                                                            end
+                                                            accN = accN + 1
+                                                        end
+                                                    end
+                                                end
+                                            end
+                                            t = t + 1
                                         end
-                                        t = t + 1
                                     end
                                 end
                             end
@@ -918,7 +1076,7 @@ function Process(req)
                 return srcR + accR, srcG + accG, srcB + accB, srcA
             end
 
-            gen = GLT_gen
+            gen = GLTE_gen
         end
 
         local r, g, b, a
@@ -934,7 +1092,8 @@ function Process(req)
                 FromR, FromG, FromB, ToR, ToG, ToB,
                 WScaleX, WScaleY,
                 RayWidth, Soft, DenseAlong,
-                p.R, p.G, p.B, p.A
+                p.R, p.G, p.B, p.A,
+                Proj, CxL, CyL, F, ThetaMax
             )
         else
             local nSide = AaSide
@@ -957,7 +1116,8 @@ function Process(req)
                         FromR, FromG, FromB, ToR, ToG, ToB,
                         WScaleX, WScaleY,
                         RayWidth, Soft, DenseAlong,
-                        p.R, p.G, p.B, p.A
+                        p.R, p.G, p.B, p.A,
+                        Proj, CxL, CyL, F, ThetaMax
                     )
                     r = r + sr
                     g = g + sg
@@ -1014,6 +1174,11 @@ function Process(req)
         ToB = toB,
         WScaleX = wScaleX,
         WScaleY = wScaleY,
+        Proj = proj,
+        CxL = cxL,
+        CyL = cyL,
+        F = f,
+        ThetaMax = thetaMax,
     }
 
     out:MultiProcessPixels(
