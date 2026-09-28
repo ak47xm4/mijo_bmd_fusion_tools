@@ -1,0 +1,677 @@
+-- Relight 2.5D mijo
+--
+-- Nuke Relight 的 2.5D 版本：每個 pixel 用 world position 與 world normal
+-- 對最多 8 盞燈做 Phong。Color 有接就當 albedo，沒接則 albedo = 1，
+-- 輸出純 lighting。不做陰影（pass 之間沒有遮擋）。
+--
+-- 燈光不是直接接 Fusion 的 3D Light（Fuse 接不到 Scene）。
+-- Inspector 上的燈槽由 A_mj_relight_bind_lights.py 用 ConnectTo 綁到
+-- LightPoint / LightSpot / LightDirectional / LightAmbient / Camera3D。
+-- 綁的是燈自己的 Translate / Rotate，不含父層 Merge3D 的位移。
+--
+-- 方向：Rot 0 時燈光局部 -Z（與 Fusion 檢視器一致）。旋轉順序 XYZ，
+-- X 先套用。Spot 的 Cone Angle 是軸到邊緣的半角（Fusion 上限 90°）。
+-- DecayType 與 Fusion 相同：0 No Decay、1 Linear = 1/dist、2 Quadratic = 1/dist²。
+--
+-- MultiProcessPixels 規則與 noise_3D_mijo.fuse 相同：
+--   processPixel 只看得到 userData 的 key。會變的值每次呼叫都從全域讀出來
+--   再當參數傳進 RLT_shade，不讓長存的 closure 自己去讀全域。
+
+-- <RLT_FORWARD>
+function RLT_lightForward(rx, ry, rz)
+    -- Local -Z, then XYZ Euler in degrees (X first, then Y, then Z).
+    local deg = math.pi / 180.0
+    local x, y, z = 0.0, 0.0, -1.0
+
+    local cx, sx = math.cos(rx * deg), math.sin(rx * deg)
+    local y1 = cx * y - sx * z
+    local z1 = sx * y + cx * z
+    y, z = y1, z1
+
+    local cy, sy = math.cos(ry * deg), math.sin(ry * deg)
+    local x2 = cy * x + sy * z
+    local z2 = -sy * x + cy * z
+    x, z = x2, z2
+
+    local cz, sz = math.cos(rz * deg), math.sin(rz * deg)
+    local x3 = cz * x - sz * y
+    local y3 = sz * x + cz * y
+    return x3, y3, z
+end
+
+-- </RLT_FORWARD>
+
+FuRegisterClass("Relight25D_mijo", CT_Tool, {
+    REGS_Name = "Relight 2.5D mijo",
+    REGS_Category = "mijo",
+    REGS_OpIconString = "R25",
+    REGS_OpDescription = "Phong relight of a 2D image from world position, world normal, and bound 3D lights",
+    REG_NoObjMatCtrls = true,
+    REG_NoMotionBlurCtrls = true,
+    REG_SupportsDoD = true,
+})
+
+function Create()
+    InPosition = self:AddInput("Position", "Position", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    InNormal = self:AddInput("Normal", "Normal", {
+        LINKID_DataType = "Image",
+        LINK_Main = 2,
+    })
+
+    InColor = self:AddInput("Color", "Color", {
+        LINKID_DataType = "Image",
+        LINK_Main = 3,
+        INP_Required = false,
+    })
+
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+
+    local function slider(label, id, default, minScale, maxScale, minAllowed, maxAllowed)
+        return self:AddInput(label, id, {
+            LINKID_DataType = "Number",
+            INPID_InputControl = "SliderControl",
+            INP_Default = default,
+            INP_MinScale = minScale,
+            INP_MaxScale = maxScale,
+            INP_MinAllowed = minAllowed,
+            INP_MaxAllowed = maxAllowed,
+        })
+    end
+
+    local function check(label, id)
+        return self:AddInput(label, id, {
+            LINKID_DataType = "Number",
+            INPID_InputControl = "CheckboxControl",
+            INP_Integer = true,
+            INP_Default = 0,
+        })
+    end
+
+    local colorGroup = 0
+    local function colorTriplet(title, idPrefix, r, g, b)
+        colorGroup = colorGroup + 1
+        local red = self:AddInput("Red", idPrefix .. "Red", {
+            ICS_Name = title,
+            LINKID_DataType = "Number",
+            INPID_InputControl = "ColorControl",
+            CLRC_ShowWheel = false,
+            INP_Default = r,
+            INP_MinScale = 0.0,
+            INP_MaxScale = 1.0,
+            INP_MinAllowed = -1.0e6,
+            INP_MaxAllowed = 1.0e6,
+            IC_ControlGroup = colorGroup,
+            IC_ControlID = 0,
+        })
+        local green = self:AddInput("Green", idPrefix .. "Green", {
+            LINKID_DataType = "Number",
+            INPID_InputControl = "ColorControl",
+            INP_Default = g,
+            INP_MinScale = 0.0,
+            INP_MaxScale = 1.0,
+            INP_MinAllowed = -1.0e6,
+            INP_MaxAllowed = 1.0e6,
+            IC_ControlGroup = colorGroup,
+            IC_ControlID = 1,
+        })
+        local blue = self:AddInput("Blue", idPrefix .. "Blue", {
+            LINKID_DataType = "Number",
+            INPID_InputControl = "ColorControl",
+            INP_Default = b,
+            INP_MinScale = 0.0,
+            INP_MaxScale = 1.0,
+            INP_MinAllowed = -1.0e6,
+            INP_MaxAllowed = 1.0e6,
+            IC_ControlGroup = colorGroup,
+            IC_ControlID = 2,
+        })
+        return red, green, blue
+    end
+
+    self:AddControlPage("Space")
+
+    InPosScale = slider("Position Scale", "PosScale", 1.0, 0.0, 10.0, -1.0e6, 1.0e6)
+
+    self:BeginControlNest("Position", "PosNest", true)
+    InFlipPosX = check("Flip X", "FlipPosX")
+    InFlipPosY = check("Flip Y", "FlipPosY")
+    InFlipPosZ = check("Flip Z", "FlipPosZ")
+    InSwapPosYZ = check("Swap Y/Z", "SwapPosYZ")
+    self:EndControlNest()
+
+    self:BeginControlNest("Normal", "NrmNest", true)
+    InFlipNrmX = check("Flip X", "FlipNrmX")
+    InFlipNrmY = check("Flip Y", "FlipNrmY")
+    InFlipNrmZ = check("Flip Z", "FlipNrmZ")
+    InSwapNrmYZ = check("Swap Y/Z", "SwapNrmYZ")
+    self:EndControlNest()
+
+    self:AddControlPage("Material")
+
+    InNormalMode = self:AddInput("Normals", "NormalMode", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 0,
+        { CCS_AddString = "Raw -1 to 1" },
+        { CCS_AddString = "Packed 0 to 1" },
+    })
+
+    InDiffuse = slider("Diffuse", "Diffuse", 1.0, 0.0, 2.0, 0.0, 1.0e6)
+    InSpecular = slider("Specular", "Specular", 0.2, 0.0, 2.0, 0.0, 1.0e6)
+    InShininess = slider("Shininess", "Shininess", 20.0, 1.0, 128.0, 1.0, 1024.0)
+    InAmbRed, InAmbGreen, InAmbBlue = colorTriplet("Ambient", "Amb", 1.0, 1.0, 1.0)
+    InAmbIntensity = slider("Ambient Intensity", "AmbIntensity", 0.0, 0.0, 1.0, 0.0, 1.0e6)
+    InUseAlpha = check("Use Alpha", "UseAlpha")
+
+    self:AddControlPage("Camera")
+
+    InCamX = slider("X", "CamX", 0.0, -10.0, 10.0, -1.0e9, 1.0e9)
+    InCamY = slider("Y", "CamY", 0.0, -10.0, 10.0, -1.0e9, 1.0e9)
+    InCamZ = slider("Z", "CamZ", 0.0, -10.0, 10.0, -1.0e9, 1.0e9)
+
+    -- Script IDs L1..L8 are the contract with A_mj_relight_bind_lights.py.
+    -- Type: 0 Point, 1 Directional, 2 Spot.
+    -- Decay: 0 No Decay, 1 Linear, 2 Quadratic. Same order as Fusion DecayType.
+    LOn = {}
+    LType = {}
+    LPosX = {}
+    LPosY = {}
+    LPosZ = {}
+    LRotX = {}
+    LRotY = {}
+    LRotZ = {}
+    LRed = {}
+    LGreen = {}
+    LBlue = {}
+    LIntensity = {}
+    LDecay = {}
+    LCone = {}
+    LPenumbra = {}
+    LDropoff = {}
+
+    for i = 1, 8 do
+        local id = "L" .. i
+        self:AddControlPage("Light " .. i)
+
+        LOn[i] = check("Enable", id .. "On")
+        LType[i] = self:AddInput("Type", id .. "Type", {
+            LINKID_DataType = "Number",
+            INPID_InputControl = "ComboControl",
+            INP_Integer = true,
+            INP_Default = 0,
+            { CCS_AddString = "Point" },
+            { CCS_AddString = "Directional" },
+            { CCS_AddString = "Spot" },
+        })
+
+        self:BeginControlNest("Position", id .. "PosNest", true)
+        LPosX[i] = slider("X", id .. "PosX", 0.0, -10.0, 10.0, -1.0e9, 1.0e9)
+        LPosY[i] = slider("Y", id .. "PosY", 0.0, -10.0, 10.0, -1.0e9, 1.0e9)
+        LPosZ[i] = slider("Z", id .. "PosZ", 0.0, -10.0, 10.0, -1.0e9, 1.0e9)
+        self:EndControlNest()
+
+        self:BeginControlNest("Rotation", id .. "RotNest", true)
+        LRotX[i] = slider("X", id .. "RotX", 0.0, -180.0, 180.0, -1.0e6, 1.0e6)
+        LRotY[i] = slider("Y", id .. "RotY", 0.0, -180.0, 180.0, -1.0e6, 1.0e6)
+        LRotZ[i] = slider("Z", id .. "RotZ", 0.0, -180.0, 180.0, -1.0e6, 1.0e6)
+        self:EndControlNest()
+
+        LRed[i], LGreen[i], LBlue[i] = colorTriplet("Color", id, 1.0, 1.0, 1.0)
+        LIntensity[i] = slider("Intensity", id .. "Intensity", 1.0, 0.0, 10.0, -1.0e6, 1.0e6)
+        LDecay[i] = self:AddInput("Decay", id .. "Decay", {
+            LINKID_DataType = "Number",
+            INPID_InputControl = "ComboControl",
+            INP_Integer = true,
+            INP_Default = 0,
+            { CCS_AddString = "No Decay" },
+            { CCS_AddString = "Linear" },
+            { CCS_AddString = "Quadratic" },
+        })
+        LCone[i] = slider("Cone Angle", id .. "Cone", 40.0, 0.0, 90.0, 0.0, 90.0)
+        LPenumbra[i] = slider("Penumbra Angle", id .. "Penumbra", 1.0, 0.0, 20.0, 0.0, 90.0)
+        LDropoff[i] = slider("Dropoff", id .. "Dropoff", 1.0, 0.0, 40.0, 0.0, 1.0e6)
+    end
+end
+
+local function regionOf(req, img)
+    local dod = req:GetInputDoD(InPosition)
+    local datawnd = dod and dod:Intersect(img.DataWindow) or img.DataWindow
+    local roi = req:GetRoI()
+    if roi then
+        datawnd = roi:Intersect(datawnd)
+    end
+    local valid = roi and roi.ValidWindow or nil
+    return datawnd, valid
+end
+
+function PrecalcProcess(req)
+    local img = InPosition:GetValue(req)
+    if not img then
+        return
+    end
+
+    local datawnd = regionOf(req, img)
+    local out = Image({
+        IMG_Like = img,
+        IMG_NoData = true,
+        IMG_DataWindow = datawnd,
+        IMG_Depth = IMG_Depth_Float,
+    })
+    if not out then
+        return
+    end
+    OutImage:Set(req, out)
+end
+
+-- Copy src into an image that shares pos's window. Pixels that do not
+-- overlap stay 0, which is the "mismatched pixel" result.
+local function alignedTo(src, like, datawnd, valid)
+    if not src then
+        return nil
+    end
+    local sdw = src.DataWindow
+    if src.Depth == IMG_Depth_Float
+        and sdw.left == datawnd.left and sdw.bottom == datawnd.bottom
+        and sdw.right == datawnd.right and sdw.top == datawnd.top then
+        return src
+    end
+    local copy = Image({
+        IMG_Like = like,
+        IMG_DataWindow = datawnd,
+        IMG_ValidWindow = valid,
+        IMG_Depth = IMG_Depth_Float,
+        IMG_NoData = true,
+    })
+    if not copy then
+        return nil
+    end
+    src:Crop(copy, {})
+    return copy
+end
+
+function Process(req)
+    local pos = InPosition:GetValue(req)
+    local nrm = InNormal:GetValue(req)
+    if not pos or not nrm then
+        return
+    end
+
+    if pos.Depth ~= IMG_Depth_Float and not RLT_warnedDepth then
+        RLT_warnedDepth = true
+        print("Relight 2.5D mijo: Position is not float. World XYZ from an 8/16-bit image will be wrong.")
+    end
+
+    local function val(inp)
+        local v = inp:GetValue(req)
+        if not v then
+            return 0.0
+        end
+        return v.Value
+    end
+
+    local posScale = val(InPosScale)
+    local flipPosX = val(InFlipPosX)
+    local flipPosY = val(InFlipPosY)
+    local flipPosZ = val(InFlipPosZ)
+    local swapPosYZ = val(InSwapPosYZ)
+    local flipNrmX = val(InFlipNrmX)
+    local flipNrmY = val(InFlipNrmY)
+    local flipNrmZ = val(InFlipNrmZ)
+    local swapNrmYZ = val(InSwapNrmYZ)
+    local normalMode = val(InNormalMode)
+    local diffAmt = val(InDiffuse)
+    local specAmt = val(InSpecular)
+    local shiny = val(InShininess)
+    local ambR = val(InAmbRed)
+    local ambG = val(InAmbGreen)
+    local ambB = val(InAmbBlue)
+    local ambI = val(InAmbIntensity)
+    local useAlpha = val(InUseAlpha)
+    local camX = val(InCamX)
+    local camY = val(InCamY)
+    local camZ = val(InCamZ)
+
+    -- Pack layout, stride 16. Must match RLT_shade.
+    --  1 on, 2 type, 3 px, 4 py, 5 pz, 6 dx, 7 dy, 8 dz,
+    --  9 cr, 10 cg, 11 cb, 12 intensity, 13 decay,
+    --  14 coneRad, 15 outerRad, 16 dropoff
+    local deg = math.pi / 180.0
+    local pack = {}
+    local n = 0
+    for i = 1, 8 do
+        local on = val(LOn[i])
+        local ty = val(LType[i])
+        local px = val(LPosX[i])
+        local py = val(LPosY[i])
+        local pz = val(LPosZ[i])
+        local dx, dy, dz = RLT_lightForward(val(LRotX[i]), val(LRotY[i]), val(LRotZ[i]))
+        local cone = val(LCone[i]) * deg
+        local outer = cone + val(LPenumbra[i]) * deg
+        if outer < cone then
+            outer = cone
+        end
+        local base = (i - 1) * 16
+        pack[base + 1] = on
+        pack[base + 2] = ty
+        pack[base + 3] = px
+        pack[base + 4] = py
+        pack[base + 5] = pz
+        pack[base + 6] = dx
+        pack[base + 7] = dy
+        pack[base + 8] = dz
+        pack[base + 9] = val(LRed[i])
+        pack[base + 10] = val(LGreen[i])
+        pack[base + 11] = val(LBlue[i])
+        pack[base + 12] = val(LIntensity[i])
+        pack[base + 13] = val(LDecay[i])
+        pack[base + 14] = cone
+        pack[base + 15] = outer
+        pack[base + 16] = val(LDropoff[i])
+        n = base + 16
+    end
+
+    local datawnd, valid = regionOf(req, pos)
+    local left = datawnd.left
+    local bottom = datawnd.bottom
+    local width = datawnd.right - left
+    local height = datawnd.top - bottom
+
+    local out = Image({
+        IMG_Like = pos,
+        IMG_DataWindow = datawnd,
+        IMG_ValidWindow = valid,
+        IMG_Depth = IMG_Depth_Float,
+        IMG_NoData = true,
+    })
+    if not out then
+        return
+    end
+    if width <= 0 or height <= 0 then
+        OutImage:Set(req, out)
+        return
+    end
+
+    local posSrc = alignedTo(pos, pos, datawnd, valid)
+    local nrmSrc = alignedTo(nrm, pos, datawnd, valid)
+    if not posSrc or not nrmSrc then
+        OutImage:Set(req, out)
+        return
+    end
+
+    local col = InColor:GetValue(req)
+    local hasColor = 0.0
+    local colSrc = posSrc
+    if col then
+        local alignedCol = alignedTo(col, pos, datawnd, valid)
+        if alignedCol then
+            colSrc = alignedCol
+            hasColor = 1.0
+        end
+    end
+
+    local userData = {
+        HasColor = hasColor,
+        NormalMode = normalMode,
+        PosScale = posScale,
+        FlipPosX = flipPosX,
+        FlipPosY = flipPosY,
+        FlipPosZ = flipPosZ,
+        SwapPosYZ = swapPosYZ,
+        FlipNrmX = flipNrmX,
+        FlipNrmY = flipNrmY,
+        FlipNrmZ = flipNrmZ,
+        SwapNrmYZ = swapNrmYZ,
+        CamX = camX,
+        CamY = camY,
+        CamZ = camZ,
+        DiffAmt = diffAmt,
+        SpecAmt = specAmt,
+        Shiny = shiny,
+        AmbR = ambR,
+        AmbG = ambG,
+        AmbB = ambB,
+        AmbI = ambI,
+        UseAlpha = useAlpha,
+        NPack = n,
+        Pack = pack,
+    }
+    for i = 1, n do
+        userData["P" .. i] = pack[i]
+    end
+
+    -- ------------------------------------------------------------------------
+    -- Pixel function
+    --
+    -- MultiProcessPixels 在 worker context 執行：模組層的函式與 Process 的 local
+    -- 都看不到，只有 userData 的 key 會被注入成全域。RLT_shade 建到 worker 全域，
+    -- 之後的 pixel 直接重用；燈光參數每次都從全域讀進來再傳進去。
+    -- ------------------------------------------------------------------------
+    local function processPixel(x, y, pp, pn, pc)
+        local shade = RLT_shade
+
+        if not shade then
+            -- <RLT_SHADE>
+            RLT_shade = function(px, py, pz, nx, ny, nz, ar, ag, ab, aa,
+                                 camx, camy, camz, pack, nPack,
+                                 diffAmt, specAmt, shiny, ambR, ambG, ambB, ambI, useAlpha)
+                local sqrt = math.sqrt
+                local acos = math.acos
+                local DIST_EPS = 1.0e-4
+                local STRIDE = 16
+
+                local function finish(r, g, b)
+                    local a = 1.0
+                    if useAlpha > 0.5 then
+                        r = r * aa
+                        g = g * aa
+                        b = b * aa
+                        a = aa
+                    end
+                    return r, g, b, a
+                end
+
+                local ambRgt = ambR * ambI
+                local ambGgt = ambG * ambI
+                local ambBgt = ambB * ambI
+
+                if px * px + py * py + pz * pz < 1.0e-12 then
+                    return finish(ar * ambRgt, ag * ambGgt, ab * ambBgt)
+                end
+
+                local nlen = sqrt(nx * nx + ny * ny + nz * nz)
+                if nlen < 1.0e-6 then
+                    return finish(ar * ambRgt, ag * ambGgt, ab * ambBgt)
+                end
+                nx, ny, nz = nx / nlen, ny / nlen, nz / nlen
+
+                if shiny < 1.0 then
+                    shiny = 1.0
+                end
+
+                local vx = camx - px
+                local vy = camy - py
+                local vz = camz - pz
+                local vlen = sqrt(vx * vx + vy * vy + vz * vz)
+                if vlen < 1.0e-8 then
+                    vx, vy, vz = 0.0, 0.0, 1.0
+                else
+                    vx, vy, vz = vx / vlen, vy / vlen, vz / vlen
+                end
+
+                local dr, dg, db = 0.0, 0.0, 0.0
+                local sr, sg, sb = 0.0, 0.0, 0.0
+                local doSpec = specAmt > 0.0
+
+                local i = 1
+                while i <= nPack do
+                    local on = pack[i]
+                    if on > 0.5 then
+                        local ty = pack[i + 1]
+                        local lpx, lpy, lpz = pack[i + 2], pack[i + 3], pack[i + 4]
+                        local dx, dy, dz = pack[i + 5], pack[i + 6], pack[i + 7]
+                        local cr, cg, cb = pack[i + 8], pack[i + 9], pack[i + 10]
+                        local intensity = pack[i + 11]
+                        local decay = pack[i + 12]
+                        local cone = pack[i + 13]
+                        local outer = pack[i + 14]
+                        local dropoff = pack[i + 15]
+
+                        local Lx, Ly, Lz, att, spotm
+                        -- 1 = Directional. Rays travel along forward, so the
+                        -- direction toward the light is -forward. No distance falloff.
+                        if ty >= 0.5 and ty < 1.5 then
+                            Lx, Ly, Lz = -dx, -dy, -dz
+                            att = 1.0
+                            spotm = 1.0
+                        else
+                            local lx = lpx - px
+                            local ly = lpy - py
+                            local lz = lpz - pz
+                            local dist = sqrt(lx * lx + ly * ly + lz * lz)
+                            if dist < DIST_EPS then
+                                dist = DIST_EPS
+                            end
+                            Lx, Ly, Lz = lx / dist, ly / dist, lz / dist
+                            if decay < 0.5 then
+                                att = 1.0
+                            elseif decay < 1.5 then
+                                att = 1.0 / dist
+                            else
+                                att = 1.0 / (dist * dist)
+                            end
+                            spotm = 1.0
+                            -- 2 = Spot. Cone is the half-angle from forward to the edge.
+                            if ty >= 1.5 then
+                                local cosAng = dx * (-Lx) + dy * (-Ly) + dz * (-Lz)
+                                if cosAng > 1.0 then
+                                    cosAng = 1.0
+                                elseif cosAng < -1.0 then
+                                    cosAng = -1.0
+                                end
+                                local ang = acos(cosAng)
+                                if ang <= cone then
+                                    spotm = 1.0
+                                elseif ang >= outer then
+                                    spotm = 0.0
+                                else
+                                    local span = outer - cone
+                                    if span < 1.0e-6 then
+                                        spotm = 0.0
+                                    else
+                                        local t = (ang - cone) / span
+                                        if dropoff <= 0.0 then
+                                            spotm = 1.0
+                                        else
+                                            spotm = (1.0 - t) ^ dropoff
+                                        end
+                                    end
+                                end
+                            end
+                        end
+
+                        local nd = nx * Lx + ny * Ly + nz * Lz
+                        if nd < 0.0 then
+                            nd = 0.0
+                        end
+                        if nd > 0.0 and spotm > 0.0 then
+                            local w = intensity * att * spotm
+                            local dw = nd * w
+                            dr = dr + cr * dw
+                            dg = dg + cg * dw
+                            db = db + cb * dw
+                            if doSpec then
+                                local rx = 2.0 * nd * nx - Lx
+                                local ry = 2.0 * nd * ny - Ly
+                                local rz = 2.0 * nd * nz - Lz
+                                local rd = rx * vx + ry * vy + rz * vz
+                                if rd < 0.0 then
+                                    rd = 0.0
+                                end
+                                local sp = (rd ^ shiny) * w
+                                sr = sr + cr * sp
+                                sg = sg + cg * sp
+                                sb = sb + cb * sp
+                            end
+                        end
+                    end
+                    i = i + STRIDE
+                end
+
+                local r = ar * (ambRgt + dr * diffAmt) + sr * specAmt
+                local g = ag * (ambGgt + dg * diffAmt) + sg * specAmt
+                local b = ab * (ambBgt + db * diffAmt) + sb * specAmt
+                return finish(r, g, b)
+            end
+            -- </RLT_SHADE>
+
+            -- Scale is nil for normals (Lua treats 0 as true, so a scale of 0 still applies).
+            RLT_space = function(x0, y0, z0, scale, swapYZ, flipX, flipY, flipZ)
+                if scale then
+                    x0 = x0 * scale
+                    y0 = y0 * scale
+                    z0 = z0 * scale
+                end
+                if swapYZ > 0.5 then
+                    y0, z0 = z0, y0
+                end
+                if flipX > 0.5 then
+                    x0 = -x0
+                end
+                if flipY > 0.5 then
+                    y0 = -y0
+                end
+                if flipZ > 0.5 then
+                    z0 = -z0
+                end
+                return x0, y0, z0
+            end
+
+            shade = RLT_shade
+        end
+
+        local px, py, pz = RLT_space(pp.R, pp.G, pp.B, PosScale, SwapPosYZ, FlipPosX, FlipPosY, FlipPosZ)
+
+        local nx, ny, nz = pn.R, pn.G, pn.B
+        if NormalMode >= 0.5 then
+            nx = nx * 2.0 - 1.0
+            ny = ny * 2.0 - 1.0
+            nz = nz * 2.0 - 1.0
+        end
+        nx, ny, nz = RLT_space(nx, ny, nz, nil, SwapNrmYZ, FlipNrmX, FlipNrmY, FlipNrmZ)
+
+        local ar, ag, ab, aa = 1.0, 1.0, 1.0, pp.A
+        if HasColor > 0.5 and pc then
+            ar, ag, ab, aa = pc.R, pc.G, pc.B, pc.A
+        end
+
+        local pack = Pack
+        if type(pack) ~= "table" then
+            local env = getfenv()
+            local count = NPack or 0
+            pack = {}
+            for i = 1, count do
+                pack[i] = env["P" .. i]
+            end
+        end
+
+        local r, g, b, a = shade(px, py, pz, nx, ny, nz, ar, ag, ab, aa,
+            CamX, CamY, CamZ, pack, NPack,
+            DiffAmt, SpecAmt, Shiny, AmbR, AmbG, AmbB, AmbI, UseAlpha)
+        pp.R = r
+        pp.G = g
+        pp.B = b
+        pp.A = a
+        return pp
+    end
+
+    out:MultiProcessPixels(nil, userData, left, bottom, width, height, posSrc, nrmSrc, colSrc, processPixel)
+    OutImage:Set(req, out)
+end
