@@ -1,0 +1,18 @@
+-- Fusion only loads .fu hotkeys from Config: (UserPaths:Config) and Profile:User.fu.
+-- A file sitting in Profiles/Default/ is not read. copy_test_mijo.cmd copies this
+-- file into Config/. Restart Fusion after copying.
+--
+-- 2D viewer zoom is GLView:SetScale (same object as Ctrl+F / the zoom menu).
+-- Ctrl+1 is Viewer_Reset, which scales to 100% and recenters.
+-- Viewer_Scale_Abs{ scale = 1 } is the zoom menu's "100%" and leaves the pan alone.
+-- Click the viewer first. Ctrl+Shift+1 in the node editor is Flow bookmark 1.
+{
+	Hotkeys {
+		Target = "GLView",
+		SHIFT_CONTROL_1 = "Viewer_Scale_Abs{ scale = 1 }",
+	},
+	Hotkeys {
+		Target = "Fusion",
+		F3 = "RunScript{ Name = 'toggle_Nodes_View_v0001', filename = 'F:\\\\Z_Afanasy_farm\\\\bmd_fusion\\\\Script\\\\Comp\\\\mijo_test\\\\toggle_Nodes_View_v0001.lua' }",
+	},
+}
