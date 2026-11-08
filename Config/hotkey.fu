@@ -15,4 +15,8 @@
 		Target = "Fusion",
 		F3 = "RunScript{ Name = 'toggle_Nodes_View_v0001', filename = 'F:\\\\Z_Afanasy_farm\\\\bmd_fusion\\\\Script\\\\Comp\\\\mijo_test\\\\toggle_Nodes_View_v0001.lua' }",
 	},
+	Hotkeys {
+		Target = "FlowView",
+		H = "RunScript{ Name = 'fusion_python_frame_flowview_to_selected', filename = 'F:\\\\Z_Afanasy_farm\\\\bmd_fusion\\\\Reactor\\\\..\\\\Script\\\\Comp\\\\mijo_test\\\\fusion_python_frame_flowview_to_selected.py' }"
+	},
 }
